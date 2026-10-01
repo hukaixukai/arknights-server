@@ -1,6 +1,31 @@
 # 明日方舟自托管平台
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)](https://www.kernel.org/)
+[![RAM](https://img.shields.io/badge/RAM-4GB%2B-brightgreen.svg)](#硬件与系统要求)
+
 一个跑在 Linux 小主机上的明日方舟多账号自动托管系统。包含 Web 控制台、实时投屏、多账号隔离、定时任务调度，以及可选的微信通知。
+
+---
+
+## 演示
+
+> 下面位置放演示 GIF 或截图。建议录制一段 30 秒左右的流程：切换账号 → 调整排班 → 任务启动 → 手机端查看战报。
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│              [ 在此插入 demo.gif 或截图 ]                │
+│                                                          │
+│   建议：docs/demo.gif，宽约 800px，README 中用           │
+│   ![demo](docs/demo.gif) 引用即可                        │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+如果你已经跑起来并愿意贡献素材，欢迎提 PR 把截图放进 `docs/` 目录。
 
 ---
 
@@ -13,6 +38,7 @@
 - [核心能力](#核心能力)
 - [部署步骤](#部署步骤)
 - [外网访问：免费域名 + Cloudflare Tunnel](#外网访问免费域名--cloudflare-tunnel)
+- [常见问题 (FAQ)](#常见问题-faq)
 - [未来规划](#未来规划)
 - [贡献者](#贡献者)
 - [许可证](#许可证)
@@ -193,6 +219,71 @@ docker compose -f compose-web.yml up -d
 5. 保存。之后手机访问 `https://ark.你的域名` 即可。
 
 这样做的好处：不需要公网 IP，不需要端口映射，HTTPS 证书由 Cloudflare 自动签发，且个人免费额度完全够用。
+
+---
+
+## 常见问题 (FAQ)
+
+### 部署相关
+
+**Q：容器起来了，但 ADB 连不上模拟器（`adb devices` 为空）？**
+
+先确认容器状态和端口：
+```bash
+docker ps | grep redroid
+adb connect 127.0.0.1:5555
+adb devices
+```
+常见原因有三个：
+- 内核 `binderfs` 没挂载成功（见[部署步骤](#部署步骤)第 1 步，检查 `ls /dev/binderfs`）；
+- `redroid` 容器启动后需要等待 30-60 秒系统才完成开机，用 `adb shell getprop sys.boot_completed` 确认返回 `1`；
+- 宿主机的 adb 版本过旧，建议 1.0.41 以上。
+
+**Q：`docker compose` 报错找不到 `adb` 或权限不足？**
+
+`compose-web.yml` 里把宿主机的 adb 挂载进容器，路径写死为 `/usr/bin/adb`。如果你的 adb 装在别处（比如 `~/.local/bin/adb`），需要同步改两处：`ADB_BIN` 环境变量和 volumes 的映射路径。
+
+**Q：需要 GPU 硬件加速吗？没有独显能跑吗？**
+
+不是必需。`docker-compose.yml` 里默认映射了 `/dev/dri/*` 做 GPU 直通，如果你的小主机没有核显或设备路径不同，删掉 `devices` 那两行即可，ReDroid 会退回软件渲染，速度慢一些但能正常跑。
+
+**Q：为什么任务跑完模拟器就关了？我想一直开着。**
+
+这是刻意设计——平时不占资源。如果确实想常驻，把账号配置里的 `on_complete` 从 `stop_emu` 改成其他值（或不自动停止），但注意会持续占用约 1.8-2.5GB 内存。
+
+### 账号相关
+
+**Q：多个账号会不会串号？**
+
+不会。每个账号使用独立的 `shared_prefs` 存档（存在 `data/account_profiles/`），登录态物理隔离。这是本项目专门处理的核心问题。首次添加账号时会自动完成登录态导出。
+
+**Q：公招的加急券怎么保证不被乱用？**
+
+代码里对公招任务固定设置了 `expedited: False`，且受 `daily_limit` 控制（默认 4 次/天）。配额用尽后只收干员、刷词条，不再消耗招聘许可。相关逻辑在 `bin/maa_runner.py`。
+
+**Q：新增账号时提示"时段冲突"？**
+
+系统要求不同账号的执行时段间隔至少 60 分钟，避免模拟器同时被多个任务抢占。调整排班时间错开即可。
+
+### 网络相关
+
+**Q：没有公网 IP，能在外面访问面板吗？**
+
+可以，用 Cloudflare Tunnel，见[外网访问](#外网访问免费域名--cloudflare-tunnel)章节。全程免费，不需要端口映射。
+
+**Q：Cloudflare Tunnel 和直接端口映射哪个好？**
+
+强烈建议用 Tunnel。端口映射会把内网服务直接暴露在公网，容易被扫描；Tunnel 是主动向外建立连接，还自带 HTTPS。
+
+### 其他
+
+**Q：这个和直接用桌面版 MAA 有什么区别？**
+
+桌面版 MAA 适合单账号、有人看着用。本项目的价值在多账号 + 无人值守 + 低功耗自托管。只有一台主力电脑、单账号的话，直接用桌面版 MAA 就行。
+
+**Q：会封号吗？**
+
+本项目只是自动化执行日常，不修改游戏数据、不使用外挂。但任何自动化都存在理论风险，请自行评估。建议合理安排任务频率，不要 24 小时不间断运行。
 
 ---
 
