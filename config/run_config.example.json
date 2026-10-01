@@ -1,5 +1,5 @@
 {
-  "infrast_plan": "333不搓玉",
+  "infrast_plan": "default_plan",
   "fight_enabled": true,
   "primary_stage": "1-7",
   "fallback_stage": "1-7"

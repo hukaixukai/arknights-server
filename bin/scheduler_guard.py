@@ -119,7 +119,7 @@ def get_account_effective_times(acc):
         single_time = inf.get("daily_single_time", "16:00")
         return [single_time]
 
-    plan_file = inf.get("plan_file", "333不搓玉.json")
+    plan_file = inf.get("plan_file", "default_plan.json")
     if not plan_file.endswith(".json"):
         plan_file += ".json"
     

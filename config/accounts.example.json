@@ -13,7 +13,7 @@
       "schedules": ["08:00", "22:00"],
       "infrast": {
         "mode": "custom_plan",
-        "plan_file": "infrast.example.json",
+        "plan_file": "default_plan.json",
         "drones": "Money",
         "threshold": 0.3,
         "dorm_not_stationed_enabled": true,

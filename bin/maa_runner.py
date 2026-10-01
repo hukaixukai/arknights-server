@@ -113,7 +113,7 @@ def list_available_infrast_plans():
 
 def resolve_infrast_file(plan_filename, owner_username=None):
     if not plan_filename:
-        plan_filename = "333不搓玉.json"
+        plan_filename = "default_plan.json"
     if not plan_filename.endswith(".json"):
         plan_filename += ".json"
     
@@ -927,7 +927,7 @@ def run_task(task_type="daily", extra_args=None):
             mall_cfg = account.get("mall", {})
             award_cfg = account.get("award", {})
     
-            infrast_file = resolve_infrast_file(infrast_cfg.get("plan_file", "333不搓玉.json"))
+            infrast_file = resolve_infrast_file(infrast_cfg.get("plan_file", "default_plan.json"))
             plan_idx = calculate_plan_index(infrast_file)
             print(f"[+] 基建排班表: {infrast_file}, 启用班次: {plan_idx}")
     
@@ -1094,7 +1094,7 @@ def run_task(task_type="daily", extra_args=None):
             })
     
         elif task_type == "infrast":
-            infrast_file = resolve_infrast_file(account.get("infrast", {}).get("plan_file", "333不搓玉.json"))
+            infrast_file = resolve_infrast_file(account.get("infrast", {}).get("plan_file", "default_plan.json"))
             plan_idx = calculate_plan_index(infrast_file)
             asst.append_task("StartUp", {"client_type": account.get("platform", "Official"), "start_game_enabled": True})
             asst.append_task("Infrast", {

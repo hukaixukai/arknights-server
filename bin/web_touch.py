@@ -1482,7 +1482,7 @@ APP_PAGE = """<!DOCTYPE html>
                 <button type="button" class="btn-action" style="padding: 8px 10px; font-size: 11px; white-space: nowrap;" onclick="togglePwdVisibility('newAccGamePwd')">👁 显隐</button>
             </div>
             <label style="font-size: 12px; color: var(--claude-text-muted);">账号备注名</label>
-            <input type="text" id="newAccName" class="form-input" placeholder="例如 官服·尾号8019" />
+            <input type="text" id="newAccName" class="form-input" placeholder="例如 官服·尾号1234" />
             <label style="font-size: 12px; color: var(--claude-text-muted);">客户端服务器平台</label>
             <select id="newAccPlatform" class="form-input">
                 <option value="Official">官方服</option>
@@ -1758,7 +1758,7 @@ APP_PAGE = """<!DOCTYPE html>
                 <div class="form-row">
                     <span>明日方舟游戏账号</span>
                     <div style="display: flex; gap: 8px; align-items: center;">
-                        <span id="cfgGameAccountDisplay" style="font-family: monospace; font-size: 13px; font-weight: 600; color: var(--claude-text-main); background: var(--claude-surface-inset); padding: 4px 10px; border-radius: var(--radius-md); border: 1px solid var(--claude-border);">******8019</span>
+                        <span id="cfgGameAccountDisplay" style="font-family: monospace; font-size: 13px; font-weight: 600; color: var(--claude-text-main); background: var(--claude-surface-inset); padding: 4px 10px; border-radius: var(--radius-md); border: 1px solid var(--claude-border);">******1234</span>
                         <input type="text" id="cfgGameAccount" class="form-input" placeholder="输入游戏手机号/UID..." style="width: 140px; text-align: center; display: none;" />
                         <button type="button" class="btn-action" style="padding: 3px 8px; font-size: 11px;" id="btnToggleAccEdit" onclick="toggleAccountEdit()">✏️ 修改</button>
                     </div>
@@ -2652,7 +2652,7 @@ APP_PAGE = """<!DOCTYPE html>
                 const inf = acc.infrast || {};
                 const modeDisplay = (inf.mode === 'daily_once')
                     ? `<span style="color: var(--claude-clay); font-weight: 600;">一天一登 (${inf.daily_single_time || '15:00'} · 原生轮换)</span>`
-                    : `<span style="color: var(--claude-text-main);">自定义排班 (${inf.plan_file || '333不搓玉.json'})</span>`;
+                    : `<span style="color: var(--claude-text-main);">自定义排班 (${inf.plan_file || 'default_plan.json'})</span>`;
                 div.innerHTML = `
                     <div>
                         <div style="font-weight: 600; font-size: 14px; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
@@ -2882,7 +2882,7 @@ APP_PAGE = """<!DOCTYPE html>
             acc.infrast = acc.infrast || {};
             acc.infrast.mode = getElVal('cfgInfrastMode', 'custom_plan');
             acc.infrast.daily_single_time = getElVal('cfgDailySingleTime', '16:00');
-            acc.infrast.plan_file = getElVal('cfgInfrastPlan', '333不搓玉.json');
+            acc.infrast.plan_file = getElVal('cfgInfrastPlan', 'default_plan.json');
             acc.infrast.drones = getElVal('cfgDronesTarget', 'Money');
             acc.infrast.dorm_trust_enabled = true;
             acc.infrast.dorm_not_stationed_enabled = true;
@@ -3099,7 +3099,7 @@ APP_PAGE = """<!DOCTYPE html>
                 schedules: effectiveSchedules,
                 infrast: { 
                     mode: infMode, 
-                    plan_file: plan_file || "333不搓玉.json", 
+                    plan_file: plan_file || "default_plan.json", 
                     drones: "Money", 
                     threshold: 50, 
                     dorm_not_stationed_enabled: true, 
@@ -4133,7 +4133,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
         elif path == "/api/infrast_plan_info":
-            fname = urllib.parse.unquote(params.get("file", ["333不搓玉.json"])[0])
+            fname = urllib.parse.unquote(params.get("file", ["default_plan.json"])[0])
             info = parse_infrast_schedule_info(fname)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
