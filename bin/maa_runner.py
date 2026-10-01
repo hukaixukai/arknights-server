@@ -620,11 +620,14 @@ def auto_login_arknights(account):
     <boolean name="IS_AUTO_LOGIN" value="false" />
 </map>'''
 
-    # 若设备内缺失基础 playerprefs.xml，从已有胡凯档案复制一份作为基底，防止弹出 1036MB 完整资源确认框
+    # 若设备内缺失基础 playerprefs.xml，从任意已有档案复制一份作为基底，防止弹出完整资源确认框
     dev_pref_chk = subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"test -f /data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml && echo YES"], stdout=subprocess.PIPE, text=True)
     if "YES" not in dev_pref_chk.stdout:
-        base_pref = PROFILES_DIR / "EXAMPLE_ACCOUNT_ID" / "shared_prefs" / "com.hypergryph.arknights.v2.playerprefs.xml"
-        if base_pref.exists():
+        base_pref = None
+        for _pf in sorted(PROFILES_DIR.glob("*/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml")):
+            base_pref = _pf
+            break
+        if base_pref and base_pref.exists():
             subprocess.run([ADB_BIN, "-s", ADB_TARGET, "push", str(base_pref), f"/data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # 推送重置后的 SDK 登录凭据

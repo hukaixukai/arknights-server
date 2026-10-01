@@ -208,8 +208,9 @@ docker compose -f compose-web.yml up -d
 
 - **主要作者**：[hukaixukai](https://github.com/hukaixukai)
 - **第二作者**：Gemini
+- **第三作者**：DeepSeek
 
-这是一个 **100% Vibe Coding** 项目。整套系统的设计、编码、调试和排障都在云端工作台中与 Gemini 结对完成——从无头 Android 容器适配、官方 SDK 登录态隔离，到公招限额算法和 Web 控制台交互，均是如此。
+这是一个 **100% Vibe Coding** 项目。整套系统的设计、编码、调试和排障都在云端工作台中与 AI 结对完成——从无头 Android 容器适配、官方 SDK 登录态隔离，到公招限额算法和 Web 控制台交互，均是如此。Gemini 与 DeepSeek 分别在不同阶段参与了架构推演、代码生成与文档打磨。
 
 ---
 

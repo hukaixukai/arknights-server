@@ -59,7 +59,6 @@ import re
 PORT = int(os.environ.get("PORT", 8090))
 ADB = os.getenv("ADB_BIN", "adb")
 DEVICE = os.getenv("ADB_TARGET", "127.0.0.1:5555")
-PASSWORD_HASH = hashlib.sha256(os.getenv("ADMIN_PASSWORD", "admin123456").encode("utf-8")).hexdigest()
 
 CONFIG_DIR = BASE_DIR / "config"
 ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"

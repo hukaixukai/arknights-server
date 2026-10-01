@@ -7,8 +7,12 @@ services:
     pid: host
     working_dir: /app
     entrypoint: ["python3", "/app/bin/web_touch.py"]
+    environment:
+      # ADB 在宿主机上的路径，若安装位置不同请修改
+      - ADB_BIN=/usr/bin/adb
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker:ro
+      # 将宿主机的 adb 二进制映射进容器，路径需与 ADB_BIN 一致
       - /usr/bin/adb:/usr/bin/adb:ro
       - ./:/app:rw

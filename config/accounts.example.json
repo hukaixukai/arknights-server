@@ -1,77 +1,88 @@
 {
-  "active_account_id": "acc_sample_001",
+  "active_account_id": "acc_example_001",
   "accounts": [
     {
-      "id": "acc_sample_001",
-      "name": "罗德岛博士1号",
+      "id": "acc_example_001",
+      "name": "我的方舟账号",
       "account_name": "13800000000",
-      "game_password": "your_game_password",
+      "game_password": "your_game_password_here",
       "platform": "Official",
       "enabled": true,
       "owner_username": "admin",
       "on_complete": "stop_emu",
       "schedules": [
-        {
-          "enabled": true,
-          "name": "早班轮转",
-          "shift": "早班",
-          "time": "08:00"
-        },
-        {
-          "enabled": true,
-          "name": "晚间清体",
-          "shift": "晚班",
-          "time": "22:00"
-        }
+        { "enabled": true, "shift": "早班", "time": "08:00" },
+        { "enabled": true, "shift": "晚班", "time": "22:00" }
       ],
       "infrast": {
         "mode": "Custom",
-        "plan_file": "333不搓玉.json",
+        "plan_file": "example_plan.json",
         "drones": "Money",
-        "threshold": 0.3
+        "threshold": 0.3,
+        "dorm_not_stationed_enabled": true,
+        "daily_single_time": "04:00",
+        "dorm_trust_enabled": false,
+        "fiammetta_recovery_enabled": false
       },
       "fight": {
-        "enabled": true,
-        "primary_stage": "1-7",
+        "mode": "daily_depot_maintain",
+        "manual_stage": "1-7",
         "fallback_stage": "1-7",
-        "medicament_limit": 999,
-        "originium_limit": 0
+        "series": 0,
+        "use_expiring_medicine": true,
+        "medicine_expire_days": 2,
+        "use_medicine": false,
+        "use_stone": false,
+        "annihilation_monday": true,
+        "annihilation_use_medicine": true
       },
       "recruit": {
         "enabled": true,
+        "times": 4,
         "daily_limit": 4,
         "today_count": 0,
-        "last_recruit_date": "2026-10-01",
-        "refresh": true,
-        "select": [4, 5],
-        "confirm": [4, 5],
-        "expedited": false,
-        "times": 4
+        "last_recruit_date": "",
+        "select_6star_strategy": "notify_user",
+        "refresh_level3": true,
+        "expedited": false
       },
       "mall": {
         "enabled": true,
-        "buy_first": ["招聘许可", "龙门币", "赤金"],
-        "reserve_credit": 50
+        "buy_first": ["赤金", "招聘许可", "龙门币"],
+        "blacklist": ["碳", "家具", "加急许可"],
+        "reserve_max_credit": true
       },
       "award": {
-        "enabled": true
+        "enabled": true,
+        "mail": true,
+        "free_gacha": true,
+        "orundum": true,
+        "mining": true,
+        "special_access": true
       },
       "notify": {
-        "enabled": true,
+        "channel": "wxpusher",
         "wxpusher": {
-          "enabled": true,
           "app_token": "SPT_YOUR_TOKEN_HERE",
           "uids": "",
           "topic_ids": ""
+        },
+        "email": {
+          "smtp_host": "smtp.example.com",
+          "smtp_port": 465,
+          "use_ssl": true,
+          "sender_email": "sender@example.com",
+          "auth_code": "your_smtp_auth_code",
+          "receiver_email": "receiver@example.com"
         }
       },
       "inventory": {
-        "last_updated": "2026-10-01 12:00:00",
-        "合成玉": 12000,
-        "至纯源石": 45,
-        "龙门币": 850000,
-        "固源岩": 120,
-        "源石碎片": 0
+        "合成玉": 0,
+        "至纯源石": 0,
+        "龙门币": 0,
+        "固源岩": 0,
+        "源石碎片": 0,
+        "last_updated": ""
       },
       "chips": {}
     }
