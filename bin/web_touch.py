@@ -1,26 +1,30 @@
 import os
 import sys
+import json
+import re
+import time
+import hmac
+import base64
+import signal
 import secrets
+import hashlib
 import pathlib
+import datetime
+import subprocess
+import urllib.parse
+import http.server
+import socketserver
 
 BASE_DIR = pathlib.Path(os.getenv("ARK_BASE_DIR", str(pathlib.Path(__file__).resolve().parent.parent)))
 BIN_DIR = BASE_DIR / "bin"
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
-import http.server
-import socketserver
-import subprocess
-import urllib.parse
-import hashlib
-import time
-import hmac
-import base64
-
 import db
 import scheduler_guard
 
 DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
+# 会话签名密钥：优先取环境变量；未设置时退化为进程级随机值（重启后登录态失效，属预期）
 SESSION_HMAC_KEY = os.getenv("SESSION_HMAC_KEY", secrets.token_hex(32)).encode("utf-8")
 ACTIVE_USER_SESSIONS = {}
 
@@ -54,16 +58,6 @@ def verify_session_token(token: str):
     except Exception:
         pass
     return None
-
-import json
-import os
-import secrets
-import signal
-import sys
-import time
-import datetime
-import pathlib
-import re
 
 PORT = int(os.environ.get("PORT", 8090))
 ADB = os.getenv("ADB_BIN", "adb")
@@ -2905,6 +2899,11 @@ APP_PAGE = """<!DOCTYPE html>
 
             acc.notify = acc.notify || {};
             acc.notify.channel = getElVal('cfgNotifyChannel', 'none');
+            acc.notify.triggers = acc.notify.triggers || {
+                on_6star_recruit: true,
+                on_daily_summary: true,
+                on_error: true
+            };
             acc.notify.wxpusher = {
                 app_token: getElVal('cfgWxToken', '').trim(),
                 uids: getElVal('cfgWxUids', '').split(',').map(s => s.trim()).filter(Boolean),

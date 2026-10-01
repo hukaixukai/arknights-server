@@ -38,7 +38,7 @@
         "times": 4,
         "daily_limit": 4,
         "today_count": 0,
-        "last_recruit_date": "",
+        "last_reset_date": "",
         "select_6star_strategy": "notify_user",
         "refresh_level3": true,
         "expedited": false
@@ -59,10 +59,15 @@
       },
       "notify": {
         "channel": "wxpusher",
+        "triggers": {
+          "on_6star_recruit": true,
+          "on_daily_summary": true,
+          "on_error": true
+        },
         "wxpusher": {
           "app_token": "SPT_YOUR_TOKEN_HERE",
-          "uids": "",
-          "topic_ids": ""
+          "uids": [],
+          "topic_ids": []
         },
         "email": {
           "smtp_host": "smtp.example.com",

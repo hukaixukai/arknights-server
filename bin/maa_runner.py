@@ -8,7 +8,6 @@ import pathlib
 import subprocess
 import re
 import fcntl
-import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 import notifier
