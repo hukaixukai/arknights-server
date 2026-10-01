@@ -111,31 +111,37 @@
 ## 🌐 远程访问教程：域名从哪里来？克拉斐尔 (Cloudflare) 怎么托管？
 
 很多人自建服务最大的痛点就是：**人在外面，手机怎么随时查看和控制家里的面板？**  
-现在家用宽带普遍没有公网 IPv4，拉宽带开端口映射又麻烦又不安全。我们的最佳解决方案是：**使用自己的域名 + 克拉斐尔 (Cloudflare Tunnel) 进行内网穿透**。
+现在家用宽带普遍没有公网 IPv4，拉宽带开端口映射又麻烦又不安全。我们的最佳解决方案是：**免费获取域名 + 克拉斐尔 (Cloudflare) 托管解析 + Cloudflare Tunnel 内网穿透**，全程一分钱不花，小白也能轻松搞定！
 
-### 1. 域名从哪里来？
-- **购买便宜的顶级域名**：前往 NameSilo、Dynadot、腾讯云、阿里云等注册商，购买一个冷门后缀（如 `.cc`、`.top`、`.xyz`、`.work`），第一年往往只要几块钱到十来块钱。
-- **配置 DNS 到 Cloudflare**：把域名的 NameServer 修改为 Cloudflare 提供的地址，将域名免费交给 Cloudflare 托管。
+### 1. 域名从哪里来？（零成本白嫖指南）
+完全不需要花钱买域名！推荐一个超棒的免费域名获取途径：
+- **访问 [DNSHE 免费二级域名平台 (https://my.dnshe.com/)](https://my.dnshe.com/)**：
+  1. 直接使用你的 **GitHub 账号一键授权登录**，无需繁琐注册；
+  2. 在控制台中免费挑选并领取一个你喜欢的二级域名（例如 `xxx.cc.cd`）；
+  3. 将领取的域名 DNS 解析或 NS (Nameserver) 记录直接**授权委托给 Cloudflare 托管**，即刻享有全球最顶级的 CDN 与解析服务。
+- *(可选)*：如果你本身已有付费购买的顶级域名（在阿里云/腾讯云/NameSilo等），同样也可以把 NS 地址改为 Cloudflare 免费接入托管。
 
 ### 2. 为什么选择“克拉斐尔” (Cloudflare Tunnel)？
-- **零公网 IP 要求**：不管你是大内网宽带、移动宽带还是手机热点，只要小主机能上网，就能穿透出来。
-- **免去路由器端口映射**：不用动路由器任何设置，安全防扫描。
-- **自带全球 CDN 与免费 HTTPS**：自动签发合规 SSL 证书，数据传输全链路加密。
-- **搭配 Cloudflare Zero Trust (完全免费)**：个人免费计划完全足够自建使用。
+- **零公网 IP 要求**：不管你是大内网宽带、移动宽带还是手机热点，只要小主机能连上互联网，就能稳稳穿透出来。
+- **免去路由器端口映射**：不用在路由器上折腾复杂的端口转发（Port Forwarding），彻底杜绝内网端口直接暴露的黑客扫描风险。
+- **自带全球 CDN 与全自动 HTTPS**：Cloudflare 自动签发安全合规的 SSL 证书，全链路加密传输。
+- **完全免费**：Cloudflare Zero Trust 的标准免费计划对个人用户额度极为充裕，日常打理方舟完全足够。
 
 ### 3. 克拉斐尔穿透实战配置
 1. 登录 [Cloudflare Zero Trust 控制台](https://one.dash.cloudflare.com/)；
-2. 进入 **Networks** -> **Tunnels**，点击 **Create a Tunnel**（创建隧道）；
-3. 复制生成的 `cloudflared` 安装命令并在你的 Linux 小主机上运行，或者直接用 Docker 运行 `cloudflared`：
+2. 进入 **Networks** -> **Tunnels**，点击 **Create a Tunnel**（创建隧道），给隧道起个名字（例如 `ark-tunnel`）；
+3. 选择 Docker 部署方式，复制生成的命令行，直接在你的 Linux 小主机上后台运行：
    ```bash
    docker run -d --name cloudflare_tunnel --restart=always \
      cloudflare/cloudflared:latest tunnel --no-autoupdate run --token <你的TUNNEL_TOKEN>
    ```
-4. 在 Cloudflare 面板的 **Public Hostname** 中添加一条规则：
-   * **Domain / Subdomain**: 输入你想要的二级域名（例如 `ark.yourdomain.com`）
+4. 在 Cloudflare 面板中的 **Public Hostname** 标签页添加路由规则：
+   * **Subdomain**: 自定义你的前缀（如 `ark`）
+   * **Domain**: 选择你在第一步通过 [my.dnshe.com](https://my.dnshe.com/) 托管过来的域名
    * **Type**: `HTTP`
-   * **URL**: `localhost:8090`（即本项目 Web 面板的本地监听端口）
-5. 点击保存！现在你在手机浏览器输入 `https://ark.yourdomain.com`，就能在全世界随时随地安全直达你的方舟控制中心了！
+   * **URL**: `localhost:8090`（即本项目 Web 面板的本地端口）
+5. 点击 **Save hostname** 保存！  
+   现在直接打开手机浏览器访问 `https://ark.你的域名`，随时随地在任何地方安全触达你的方舟控制中心！
 
 ---
 
