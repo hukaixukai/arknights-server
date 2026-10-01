@@ -3576,7 +3576,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 subprocess.run(["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.Popen(["python3", str(RUNNER_SCRIPT), stage, acc_id])
+                # 统一走 ark_service_ctl.sh，享受一致的“单班次 1 小时上限”与抢占保护
+                ctl = BASE_DIR / "bin" / "ark_service_ctl.sh"
+                if ctl.exists():
+                    subprocess.Popen(["bash", str(ctl), "run-daily", acc_id])
+                else:
+                    subprocess.Popen(["python3", str(RUNNER_SCRIPT), stage, acc_id])
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

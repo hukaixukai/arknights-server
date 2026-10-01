@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import signal
 import datetime
 import pathlib
 import subprocess
@@ -12,6 +13,21 @@ import tempfile
 import xml.etree.ElementTree as ET
 import notifier
 import db
+
+# 被顶号 / 超时抢占标志。
+# 当收到 SIGTERM（通常由 timeout 到点触发，意味着账号被顶号或占用超时），
+# 置位该标志，主循环检测到后立即放弃整个任务，不重试、不接续。
+_KICKED_OUT = False
+
+
+def _handle_termination(signum, frame):
+    global _KICKED_OUT
+    _KICKED_OUT = True
+    print(f"\n[!] 收到终止信号 (signal={signum})，判定为账号被顶号或班次超时，准备放弃当前任务...", flush=True)
+
+
+signal.signal(signal.SIGTERM, _handle_termination)
+signal.signal(signal.SIGINT, _handle_termination)
 
 BASE_DIR = pathlib.Path(os.getenv("ARK_BASE_DIR", str(pathlib.Path(__file__).resolve().parent.parent)))
 DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
@@ -1143,7 +1159,23 @@ def run_task(task_type="daily", extra_args=None):
         asst.start()
     
         while asst.running():
+            # 收到终止信号（被顶号 / 班次超时）立即中止，不等任务自然跑完
+            if _KICKED_OUT:
+                print("[!] 检测到被顶号或超时信号，正在中止 MAA 任务链...")
+                try:
+                    asst.stop()
+                except Exception:
+                    pass
+                break
             time.sleep(2)
+    
+        if _KICKED_OUT:
+            print("[✗] 本次班次判定为【被顶号 / 超时】，任务放弃（未完成，不作完成简报）。")
+            # 按退出策略收尾：默认关闭客户端与模拟器，避免占用下一班次资源
+            on_complete_action = account.get("on_complete", "stop_emu")
+            if on_complete_action == "stop_emu":
+                execute_exit_action(on_complete_action)
+            return False
     
         print("[✔] MAA 任务链执行完毕！")
     
