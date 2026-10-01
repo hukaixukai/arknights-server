@@ -1,4 +1,6 @@
-# 明日方舟自托管平台
+# Arknights Self-Host Hub · 明日方舟多账号低功耗自托管系统
+
+> **关键词**：明日方舟 / Arknights / 多账号托管 / 自动挂机 / 基建排班 / 公招 / MAA / MaaAssistantArknights / ReDroid / 无头安卓 / Docker / 自托管 / Self-Hosted / 低功耗小主机 / 软路由 / NAS / 内网穿透 / Cloudflare Tunnel / 微信通知
 
 一个跑在 Linux 小主机上的明日方舟多账号自动托管系统。包含 Web 控制台、实时投屏、多账号隔离、定时任务调度，以及可选的微信通知。
 
