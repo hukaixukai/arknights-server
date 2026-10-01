@@ -206,7 +206,7 @@ docker compose -f compose-web.yml up -d
 
 ## 贡献者
 
-- **主要作者**：胡凯（Kai Hu）
+- **主要作者**：[hukaixukai](https://github.com/hukaixukai)
 - **第二作者**：Gemini
 
 这是一个 **100% Vibe Coding** 项目。整套系统的设计、编码、调试和排障都在云端工作台中与 Gemini 结对完成——从无头 Android 容器适配、官方 SDK 登录态隔离，到公招限额算法和 Web 控制台交互，均是如此。
