@@ -10,13 +10,10 @@
       "enabled": true,
       "owner_username": "admin",
       "on_complete": "stop_emu",
-      "schedules": [
-        { "enabled": true, "shift": "早班", "time": "08:00" },
-        { "enabled": true, "shift": "晚班", "time": "22:00" }
-      ],
+      "schedules": ["08:00", "22:00"],
       "infrast": {
-        "mode": "Custom",
-        "plan_file": "example_plan.json",
+        "mode": "custom_plan",
+        "plan_file": "infrast.example.json",
         "drones": "Money",
         "threshold": 0.3,
         "dorm_not_stationed_enabled": true,

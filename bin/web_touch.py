@@ -8,6 +8,15 @@ BIN_DIR = BASE_DIR / "bin"
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
+import http.server
+import socketserver
+import subprocess
+import urllib.parse
+import hashlib
+import time
+import hmac
+import base64
+
 import db
 import scheduler_guard
 

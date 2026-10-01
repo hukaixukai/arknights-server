@@ -115,23 +115,36 @@ MAA（图像识别与任务执行）
   "title": "我的排班",
   "plans": [
     {
-      "name": "早班",
-      "period": [["07:00", "15:00"]],
+      "name": "早",
+      "period": [["10:00", "16:00"]],
       "rooms": {
-        "贸易站": ["干员A", "干员B", "干员C"],
-        "制造站": ["干员D", "干员E", "干员F"],
-        "控制中枢": ["干员G"],
-        "宿舍": ["干员H", "干员I"]
+        "trading": [
+          { "operators": ["干员A", "干员B", "干员C"], "product": "LMD" }
+        ],
+        "manufacture": [
+          { "operators": ["干员D", "干员E", "干员F"], "product": "PureGold" }
+        ],
+        "power": [{ "operators": ["干员G"] }],
+        "dormitory": [{ "operators": ["干员H", "干员I"] }],
+        "control": [{ "operators": ["干员J"] }]
       }
     },
     {
-      "name": "晚班",
-      "period": [["15:00", "23:00"]],
-      "rooms": { "...": ["..."] }
+      "name": "晚",
+      "period": [["16:00", "22:00"]],
+      "rooms": { "...": ["同上结构"] }
     }
   ]
 }
 ```
+
+字段说明：
+
+- `name`：班次名称。
+- `period`：该班次的生效时间段，格式为 `[["开始", "结束"]]`。可以写多段（例如跨午夜的晚班写 `[["22:00", "23:59"], ["00:00", "10:00"]]`）。**一天有几个班次，就等于每天登入换班几次。**
+- `rooms`：各房间的干员安排。房间键为 `trading`（贸易站）、`manufacture`（制造站）、`power`（发电站）、`dormitory`（宿舍）、`control`（控制中枢）、`meeting`（会客室）、`hire`（人力办公室）、`processing`（加工站）等。
+
+这种格式就是 MAA 和一图流排班表生成器导出的标准格式，可以直接用生成器导出后上传。
 
 把文件通过 Web 面板上传（`/api/infrast_plans/upload`），或在账号策略里选择已有的排班文件即可。每个账号的排班文件按所有者隔离存放，互不可见。
 
@@ -187,7 +200,15 @@ cp config/system_settings.example.json config/system_settings.json
 cp config/users.example.json config/users.json
 ```
 
-然后按注释填写 `config/*.json`，至少要在 `users.json` 里设置管理员密码哈希，在 `accounts.json` 里填入账号信息。
+然后按注释填写 `config/*.json`。管理员的密码哈希可以这样生成：
+
+```bash
+python3 -c "import hashlib; print(hashlib.sha256('你的密码'.encode()).hexdigest())"
+```
+
+把输出填进 `users.json` 的 `password_hash`。`accounts.example.json` 里的 `infrast.plan_file` 指向 `config/infrast.example.json`，这是一份三班次示例排班表，可直接改名使用或替换成自己导出的排班文件。
+
+> 注意：`users.example.json` 里的默认账号是 `admin` / 密码 `admin`，**务必在部署前改成自己的强密码**。`config/` 下的真实配置文件（`accounts.json`、`users.json` 等）已在 `.gitignore` 中排除，不会被提交。
 
 ### 3. 启动服务
 

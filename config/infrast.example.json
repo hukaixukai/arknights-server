@@ -1,0 +1,45 @@
+{
+  "title": "示例排班表",
+  "description": "这是一个三班次示例，请替换为你自己的干员。或用一图流排班表生成器导出后上传。",
+  "plans": [
+    {
+      "name": "早",
+      "period": [["10:00", "16:00"]],
+      "rooms": {
+        "trading": [{ "operators": ["干员A", "干员B", "干员C"], "product": "LMD" }],
+        "manufacture": [{ "operators": ["干员D", "干员E", "干员F"], "product": "PureGold" }],
+        "power": [{ "operators": ["干员G"] }],
+        "control": [{ "operators": ["干员H"] }],
+        "meeting": [{ "operators": ["干员I", "干员J"] }],
+        "hire": [{ "operators": ["干员K"] }],
+        "dormitory": [{ "operators": ["干员L", "干员M", "干员N", "干员O", "干员P"] }]
+      }
+    },
+    {
+      "name": "午",
+      "period": [["16:00", "22:00"]],
+      "rooms": {
+        "trading": [{ "operators": ["干员A", "干员Q", "干员R"], "product": "LMD" }],
+        "manufacture": [{ "operators": ["干员D", "干员S", "干员T"], "product": "PureGold" }],
+        "power": [{ "operators": ["干员U"] }],
+        "control": [{ "operators": ["干员V"] }],
+        "meeting": [{ "operators": ["干员I", "干员W"] }],
+        "hire": [{ "operators": ["干员X"] }],
+        "dormitory": [{ "operators": ["干员L", "干员M", "干员N", "干员O", "干员P"] }]
+      }
+    },
+    {
+      "name": "晚",
+      "period": [["22:00", "23:59"], ["00:00", "10:00"]],
+      "rooms": {
+        "trading": [{ "operators": ["干员B", "干员C", "干员Y"], "product": "LMD" }],
+        "manufacture": [{ "operators": ["干员E", "干员F", "干员Z"], "product": "PureGold" }],
+        "power": [{ "operators": ["干员G"] }],
+        "control": [{ "operators": ["干员H"] }],
+        "meeting": [{ "operators": ["干员I", "干员J"] }],
+        "hire": [{ "operators": ["干员K"] }],
+        "dormitory": [{ "operators": ["干员L", "干员M", "干员N", "干员O", "干员P"] }]
+      }
+    }
+  ]
+}
