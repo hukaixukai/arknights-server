@@ -33,12 +33,6 @@ logs/
 *.png
 *.gif
 
-# But allow docs assets (screenshots / demo)
-!docs/
-!docs/**
-!docs/*.png
-!docs/*.gif
-
 # OS & Editor files
 .DS_Store
 Thumbs.db

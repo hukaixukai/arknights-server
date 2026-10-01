@@ -1,31 +1,6 @@
 # 明日方舟自托管平台
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
-[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)](https://www.kernel.org/)
-[![RAM](https://img.shields.io/badge/RAM-4GB%2B-brightgreen.svg)](#硬件与系统要求)
-
 一个跑在 Linux 小主机上的明日方舟多账号自动托管系统。包含 Web 控制台、实时投屏、多账号隔离、定时任务调度，以及可选的微信通知。
-
----
-
-## 演示
-
-> 下面位置放演示 GIF 或截图。建议录制一段 30 秒左右的流程：切换账号 → 调整排班 → 任务启动 → 手机端查看战报。
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                                                          │
-│              [ 在此插入 demo.gif 或截图 ]                │
-│                                                          │
-│   建议：docs/demo.gif，宽约 800px，README 中用           │
-│   ![demo](docs/demo.gif) 引用即可                        │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
-```
-
-如果你已经跑起来并愿意贡献素材，欢迎提 PR 把截图放进 `docs/` 目录。
 
 ---
 
