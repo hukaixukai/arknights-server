@@ -364,11 +364,12 @@ def calculate_plan_index(infrast_path):
                 if len(period) == 2:
                     start, end = period[0], period[1]
                     if start <= end:
-                        if start <= now_str <= end:
+                        is_match = (start <= now_str <= end) if end in ("23:59", "24:00") else (start <= now_str < end)
+                        if is_match:
                             print(f"[+] 当前时间 {now_str} 匹配到排班: {plan.get('name', idx)} (index={idx})")
                             return idx
                     else:
-                        if now_str >= start or now_str <= end:
+                        if now_str >= start or now_str < end:
                             print(f"[+] 当前时间 {now_str} 跨午夜匹配到排班: {plan.get('name', idx)} (index={idx})")
                             return idx
     except Exception as e:
