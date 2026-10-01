@@ -46,6 +46,7 @@ if [ -n "$LATEST_TAG" ]; then
 
     if [ "$CURRENT_TAG" != "$LATEST_TAG" ]; then
         log "[+] 发现新版本 ($CURRENT_TAG -> $LATEST_TAG)，开始下载更新包..."
+        # 若访问 GitHub 缓慢，可将下方 URL 前缀替换为加速镜像，例如 https://ghfast.top/
         TAR_URL="https://github.com/MaaAssistantArknights/MaaAssistantArknights/releases/download/${LATEST_TAG}/MAA-${LATEST_TAG}-linux-x86_64.tar.gz"
         TMP_FILE="/tmp/MAA_${LATEST_TAG}.tar.gz"
         

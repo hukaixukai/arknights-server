@@ -12,6 +12,7 @@
 - [技术架构](#技术架构)
 - [核心能力](#核心能力)
 - [部署步骤](#部署步骤)
+- [自动更新](#5-配置自动更新可选推荐)
 - [外网访问：免费域名 + Cloudflare Tunnel](#外网访问免费域名--cloudflare-tunnel)
 - [常见问题 (FAQ)](#常见问题-faq)
 - [未来规划](#未来规划)
@@ -144,6 +145,13 @@ MAA（图像识别与任务执行）
 
 **通知推送。** 任务结束后生成 Markdown 报告，支持 WxPusher（微信）与邮件。
 
+**自动更新（MAA 与游戏本体）。** 两个更新脚本各管一块：
+
+- `bin/update_maa.sh` 每天检查一次：拉取 MAA 静态特征库（MaaResource）热更新，并比对 MaaCore 的 GitHub 最新 Release 版本，有新版就下载并热替换 `libMaaCore.so`（旧版自动备份到 `maa/backup/`）。
+- `bin/update_arknights.sh` 通过官方 CDN 探测明日方舟最新版本号（`arknights-hg-<版本号>.apk`），与模拟器内已安装版本比对，不一致就下载 APK（支持断点续传）并执行 `install -r` 无损覆盖安装，保留登录凭据。更新完成会推送一条通知。
+
+两个脚本都会在需要时按需拉起模拟器，结束后自动归位休眠。
+
 **防时段冲突。** 新增账号时若与其他账号的执行时段间隔小于 60 分钟，会被拦截并提示。
 
 ---
@@ -196,6 +204,35 @@ docker compose -f compose-web.yml up -d
 ### 4. 配置定时任务
 
 系统会根据各账号的排班时间自动写入 crontab，无需手动编辑。账号策略里设定好每天的执行时段即可。
+
+### 5. 配置自动更新（可选，推荐）
+
+两个脚本可以设成每日定时执行，让 MAA 和游戏本体始终跟上最新版本：
+
+```cron
+# 每天凌晨检查并更新 MAA 与游戏本体
+0 3 * * * /path/to/arknights-server/bin/update_maa.sh >> /path/to/arknights-server/maa/update.log 2>&1
+30 3 * * * /path/to/arknights-server/bin/update_arknights.sh >> /path/to/arknights-server/update_apk.log 2>&1
+```
+
+也可以手动执行：
+
+```bash
+./bin/update_maa.sh                # 更新 MAA 特征库与核心库
+./bin/update_arknights.sh          # 检查并更新游戏本体
+./bin/update_arknights.sh --force  # 强制重新下载安装包
+```
+
+**更新逻辑说明：**
+
+| 脚本 | 更新对象 | 版本判断方式 |
+| --- | --- | --- |
+| `update_maa.sh` | MaaResource 特征库 + MaaCore 核心库 | 比对 GitHub Release 最新 tag 与本地 `maa/version.txt` |
+| `update_arknights.sh` | 明日方舟游戏本体 APK | 解析官方 CDN 包名中的版本号，与 `dumpsys package` 读取的已装版本比对 |
+
+两个脚本都不会影响已保存的登录态：游戏用 `install -r`（覆盖安装 + 保留数据），MAA 只替换核心库并备份旧版。
+
+> 提示：如果服务器访问 GitHub 较慢，可以把 `update_maa.sh` 里的下载地址换成 GitHub 加速镜像（在 URL 前拼 `https://ghfast.top/`），脚本内已用注释标出可替换的位置。
 
 ---
 
