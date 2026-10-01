@@ -1,0 +1,79 @@
+{
+  "active_account_id": "acc_sample_001",
+  "accounts": [
+    {
+      "id": "acc_sample_001",
+      "name": "罗德岛博士1号",
+      "account_name": "13800000000",
+      "game_password": "your_game_password",
+      "platform": "Official",
+      "enabled": true,
+      "owner_username": "admin",
+      "on_complete": "stop_emu",
+      "schedules": [
+        {
+          "enabled": true,
+          "name": "早班轮转",
+          "shift": "早班",
+          "time": "08:00"
+        },
+        {
+          "enabled": true,
+          "name": "晚间清体",
+          "shift": "晚班",
+          "time": "22:00"
+        }
+      ],
+      "infrast": {
+        "mode": "Custom",
+        "plan_file": "333不搓玉.json",
+        "drones": "Money",
+        "threshold": 0.3
+      },
+      "fight": {
+        "enabled": true,
+        "primary_stage": "1-7",
+        "fallback_stage": "1-7",
+        "medicament_limit": 999,
+        "originium_limit": 0
+      },
+      "recruit": {
+        "enabled": true,
+        "daily_limit": 4,
+        "today_count": 0,
+        "last_recruit_date": "2026-10-01",
+        "refresh": true,
+        "select": [4, 5],
+        "confirm": [4, 5],
+        "expedited": false,
+        "times": 4
+      },
+      "mall": {
+        "enabled": true,
+        "buy_first": ["招聘许可", "龙门币", "赤金"],
+        "reserve_credit": 50
+      },
+      "award": {
+        "enabled": true
+      },
+      "notify": {
+        "enabled": true,
+        "wxpusher": {
+          "enabled": true,
+          "app_token": "SPT_YOUR_TOKEN_HERE",
+          "uids": "",
+          "topic_ids": ""
+        }
+      },
+      "inventory": {
+        "last_updated": "2026-10-01 12:00:00",
+        "合成玉": 12000,
+        "至纯源石": 45,
+        "龙门币": 850000,
+        "固源岩": 120,
+        "源石碎片": 0
+      },
+      "chips": {}
+    }
+  ]
+}

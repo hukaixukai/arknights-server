@@ -1,0 +1,39 @@
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Runtime databases & locks
+config/*.db
+config/*.db-shm
+config/*.db-wal
+config/active_crontab.txt
+config/crontab_backup*
+/tmp/*.lock
+*.lock
+
+# User real configs (keep example files only)
+config/accounts.json
+config/users.json
+config/system_settings.json
+config/run_config.json
+
+# Game packages & runtime data
+*.apk
+data/
+maa/debug/
+maa/data/
+maa/version.txt
+maa/backup/
+logs/
+*.log
+*.png
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

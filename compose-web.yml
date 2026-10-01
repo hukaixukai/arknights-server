@@ -1,0 +1,14 @@
+services:
+  ark-web:
+    image: python:3.11-slim
+    container_name: ark_web_touch
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    working_dir: /app
+    entrypoint: ["python3", "/app/bin/web_touch.py"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/bin/adb:/usr/bin/adb:ro
+      - ./:/app:rw

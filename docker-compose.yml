@@ -1,0 +1,22 @@
+services:
+  redroid:
+    image: erstt/redroid:11.0.0_ndk_ChromeOS
+    container_name: redroid_arknights
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5555:5555"
+    volumes:
+      - ./data:/data
+      - /dev/binderfs:/dev/binderfs
+    devices:
+      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    command:
+      - androidboot.redroid_width=1280
+      - androidboot.redroid_height=720
+      - androidboot.redroid_dpi=240
+      - androidboot.redroid_fps=30
+      - androidboot.use_memfd=1
+      - androidboot.redroid_gpu_mode=host
+      - ro.sf.lcd_density=240
