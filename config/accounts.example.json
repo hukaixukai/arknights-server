@@ -16,7 +16,7 @@
         "plan_file": "default_plan.json",
         "drones": "Money",
         "threshold": 0.3,
-        "dorm_not_stationed_enabled": true,
+        "dorm_not_stationed_enabled": false,
         "daily_single_time": "04:00",
         "dorm_trust_enabled": false,
         "fiammetta_recovery_enabled": false

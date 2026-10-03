@@ -6,6 +6,7 @@ import time
 import hmac
 import base64
 import signal
+import shutil
 import secrets
 import hashlib
 import pathlib
@@ -59,8 +60,17 @@ def verify_session_token(token: str):
         pass
     return None
 
+def find_adb():
+    candidate = shutil.which("adb")
+    if candidate:
+        return candidate
+    local_adb = pathlib.Path.home() / ".local" / "bin" / "adb"
+    if local_adb.exists():
+        return str(local_adb)
+    return "adb"
+
 PORT = int(os.environ.get("PORT", 8090))
-ADB = os.getenv("ADB_BIN", "adb")
+ADB = os.getenv("ADB_BIN", find_adb())
 DEVICE = os.getenv("ADB_TARGET", "127.0.0.1:5555")
 
 CONFIG_DIR = BASE_DIR / "config"
@@ -2879,7 +2889,7 @@ APP_PAGE = """<!DOCTYPE html>
             acc.infrast.plan_file = getElVal('cfgInfrastPlan', 'default_plan.json');
             acc.infrast.drones = getElVal('cfgDronesTarget', 'Money');
             acc.infrast.dorm_trust_enabled = true;
-            acc.infrast.dorm_not_stationed_enabled = true;
+            acc.infrast.dorm_not_stationed_enabled = false;
             acc.infrast.fiammetta_recovery_enabled = true;
 
             acc.fight = acc.fight || {};
@@ -3101,7 +3111,7 @@ APP_PAGE = """<!DOCTYPE html>
                     plan_file: plan_file || "default_plan.json", 
                     drones: "Money", 
                     threshold: 50, 
-                    dorm_not_stationed_enabled: true, 
+                    dorm_not_stationed_enabled: false, 
                     daily_single_time: dailyTime 
                 },
                 fight: { mode: "daily_depot_maintain", manual_stage: "CW-10", fallback_stage: "1-7", series: 0, use_expiring_medicine: true, medicine_expire_days: 2, use_medicine: false, use_stone: false, annihilation_monday: true, annihilation_use_medicine: true },

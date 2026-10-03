@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import signal
+import shutil
 import datetime
 import pathlib
 import subprocess
@@ -13,6 +14,15 @@ import tempfile
 import xml.etree.ElementTree as ET
 import notifier
 import db
+
+def find_adb():
+    candidate = shutil.which("adb")
+    if candidate:
+        return candidate
+    local_adb = pathlib.Path.home() / ".local" / "bin" / "adb"
+    if local_adb.exists():
+        return str(local_adb)
+    return "adb"
 
 # 被顶号 / 超时抢占标志。
 # 当收到 SIGTERM（通常由 timeout 到点触发，意味着账号被顶号或占用超时），
@@ -40,8 +50,8 @@ DEPOT_FILE = MAA_DIR / "data" / "DepotData.json"
 OPER_BOX_FILE = MAA_DIR / "data" / "OperBoxData.json"
 EVENT_6STAR_FILE = pathlib.Path(os.getenv("EVENT_6STAR_FILE", str(BASE_DIR / "data" / "recruit_6star_event.json")))
 COMPOSE_FILE = BASE_DIR / "docker-compose.yml"
-ADB_BIN = os.getenv("ADB_BIN", "adb")
-ADB_TARGET = "127.0.0.1:5555"
+ADB_BIN = os.getenv("ADB_BIN", find_adb())
+ADB_TARGET = os.getenv("ADB_TARGET", "127.0.0.1:5555")
 
 PROFILES_DIR = BASE_DIR / "data" / "account_profiles"
 LOCK_FILE_PATH = pathlib.Path("/tmp/ark_runner.lock")
@@ -301,10 +311,12 @@ def update_account_inventory(data_json):
     print(f"[✔] 已同步账号 [{acc.get('name')}] 的全量货币与芯片数据至 SQLite 数据库 (已收录芯片 {len(chips_dict)} 种)")
 
 CURRENT_RECRUIT_CONFIRMED = 0
+CURRENT_ASST_INSTANCE = None
+FAILED_TASKCHAINS = set()
 
 @Asst.CallBackType
 def log_callback(msg, details, arg):
-    global CURRENT_RECRUIT_CONFIRMED
+    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE
     m = Message(msg)
     try:
         d = json.loads(details.decode('utf-8'))
@@ -312,6 +324,19 @@ def log_callback(msg, details, arg):
         d = details.decode('utf-8', errors='ignore')
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{now}] [{m.name}] {d}")
+
+    # 捕获任务链失败 (若关键唤醒 StartUp 失败，立即中止后续空转)
+    if m.name == "TaskChainError" and isinstance(d, dict):
+        tc = d.get("taskchain")
+        if tc:
+            FAILED_TASKCHAINS.add(tc)
+            if tc == "StartUp":
+                print(f"[!] 关键任务 [StartUp] 唤醒失败，紧急中止后续任务链，避免无效空转！")
+                if CURRENT_ASST_INSTANCE:
+                    try:
+                        CURRENT_ASST_INSTANCE.stop()
+                    except Exception:
+                        pass
 
     # 捕获公招开槽确认并统计今日已消耗数量
     if isinstance(d, dict) and d.get("taskchain") == "Recruit":
@@ -606,6 +631,98 @@ def keyevent_press(code):
 def input_text_safe(text):
     clean_text = str(text)
     subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "input", "text", clean_text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def get_device_rx_bytes():
+    try:
+        out = subprocess.check_output([ADB_BIN, "-s", ADB_TARGET, "shell", "cat", "/proc/net/dev"], text=True, timeout=5)
+        for line in out.splitlines():
+            if "eth0:" in line:
+                parts = line.split("eth0:")[1].split()
+                return int(parts[0])
+    except Exception:
+        pass
+    return 0
+
+def guard_game_startup(pkg, platform):
+    """
+    启动守护探针：
+    1. 区分“连接假死”（0 流量停滞）与“真下载热更”（流量持续增加，即使 500MB 也动态守护放行）。
+    2. 自动检测并点击更新确认弹窗。
+    3. 若真卡死无流量超过 60 秒，自动强杀重启重试。
+    """
+    print(f"[*] 启动游戏守护探针: 正在预唤醒客户端 [{pkg}] 并探测更新状态...")
+    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "start", "-n", f"{pkg}/com.u8.sdk.U8UnityContext"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    last_rx = get_device_rx_bytes()
+    stall_sec = 0
+    total_dl_bytes = 0
+    restarts = 0
+    max_restarts = 2
+    
+    start_time = time.time()
+    while time.time() - start_time < 900:  # 最长宽限 15 分钟
+        time.sleep(5)
+        
+        # 1. 检测弹窗：自动确认热更下载对话框或公告
+        xml = dump_ui_xml()
+        if xml:
+            # 确认更新弹窗
+            confirm_pos = find_node_bounds(xml, text="确认") or find_node_bounds(xml, text="确定")
+            if confirm_pos and ("更新" in xml or "下载" in xml or "资源" in xml or "新版本" in xml):
+                print(f"[+] 检测到热更/资源确认弹窗，自动点击确认 ({confirm_pos[0]}, {confirm_pos[1]})...")
+                tap_screen(confirm_pos[0], confirm_pos[1])
+                time.sleep(2)
+                continue
+            
+            # 公告关闭
+            if find_node_bounds(xml, text="活动公告") or find_node_bounds(xml, text="系统公告"):
+                print("[+] 检测到游戏公告，自动关闭...")
+                tap_screen(940, 104)
+                time.sleep(2)
+        
+        # 2. 检查网络流量变化
+        curr_rx = get_device_rx_bytes()
+        diff = max(0, curr_rx - last_rx)
+        last_rx = curr_rx
+        
+        if diff > 100 * 1024:  # 5 秒内流量超过 100KB，说明正在活跃下载更新包
+            stall_sec = 0
+            total_dl_bytes += diff
+            speed_kb = diff / 5.0 / 1024.0
+            print(f"[+] 检测到游戏正在下载热更新数据... (已传输: {total_dl_bytes / 1024 / 1024:.1f} MB, 速率: {speed_kb:.1f} KB/s)")
+            continue
+        else:
+            stall_sec += 5
+
+        # 3. 检查是否平稳就绪 (Activity 聚焦且网络流量已平稳)
+        try:
+            focus_out = subprocess.check_output([ADB_BIN, "-s", ADB_TARGET, "shell", "dumpsys", "window"], text=True, timeout=5)
+            if f"{pkg}/" in focus_out and "mCurrentFocus" in focus_out and (time.time() - start_time) >= 15:
+                if stall_sec >= 15 and total_dl_bytes > 0:
+                    print(f"[✔] 热更下载与解包完成 (共下载 {total_dl_bytes / 1024 / 1024:.1f} MB)，客户端已平稳就绪！")
+                    return True
+                elif stall_sec >= 15 and total_dl_bytes == 0:
+                    print("[+] 客户端启动平稳就绪，无需热更下载，交接给 MAA 任务链。")
+                    return True
+        except Exception:
+            pass
+
+        # 4. 假死处理：如果持续 60 秒 0 字节下载且未就绪，判定为握手假死
+        if stall_sec >= 60 and total_dl_bytes == 0:
+            if restarts < max_restarts:
+                restarts += 1
+                print(f"[!] 警告: 客户端启动 60 秒无网络数据流动，判定为 CDN 握手假死！正在执行看门狗强杀重启 (第 {restarts}/{max_restarts} 次)...")
+                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(2)
+                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "start", "-n", f"{pkg}/com.u8.sdk.U8UnityContext"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stall_sec = 0
+                start_time = time.time()
+                continue
+            else:
+                print(f"[!] 客户端经 {max_restarts} 次重启依然处于未就绪状态，交由 MAA 尝试最后唤醒。")
+                break
+
+    return True
 
 def auto_login_arknights(account):
     """
@@ -907,8 +1024,9 @@ def run_task(task_type="daily", extra_args=None):
         return False
 
     CURRENT_ACCOUNT_DATA = account
-    global CURRENT_RECRUIT_CONFIRMED
+    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE
     CURRENT_RECRUIT_CONFIRMED = 0
+    FAILED_TASKCHAINS = set()
     mark_running_task(account, True)
 
     try:
@@ -916,11 +1034,16 @@ def run_task(task_type="daily", extra_args=None):
         acc_name = account.get("name", "默认账号")
         print(f"[*] 启动任务: {task_type} · 目标账号: [{acc_name}] (ID: {account.get('id')})")
 
+        # 启动下载守护与前置假死看门狗
+        pkg = "com.bilibili.arknights" if account.get("platform") == "Bilibili" else "com.hypergryph.arknights"
+        guard_game_startup(pkg, account.get("platform", "Official"))
+
         load_owned_6stars(account.get("id"))
     
         print(f"[*] 正在初始化 MAA 官方核心引擎: {MAA_DIR}")
         Asst.load(path=MAA_DIR)
         asst = Asst(callback=log_callback)
+        CURRENT_ASST_INSTANCE = asst
     
         asst.set_instance_option(InstanceOptionType.touch_type, "adb")
     
@@ -1003,7 +1126,7 @@ def run_task(task_type="daily", extra_args=None):
                     "mode": 0,
                     "drones": drones_target,
                     "threshold": dorm_threshold,
-                    "dorm_not_stationed_enabled": True
+                    "dorm_not_stationed_enabled": False
                 })
             else:
                 print(f"[+] 基建换班模式: 【自定义排班表】 ({infrast_file}, 启用班次: {plan_idx})")
@@ -1014,7 +1137,7 @@ def run_task(task_type="daily", extra_args=None):
                     "plan_index": plan_idx,
                     "drones": drones_target,
                     "threshold": dorm_threshold,
-                    "dorm_not_stationed_enabled": infrast_cfg.get("dorm_not_stationed_enabled", True),
+                    "dorm_not_stationed_enabled": infrast_cfg.get("dorm_not_stationed_enabled", False),
                     "dorm_trust_enabled": infrast_cfg.get("dorm_trust_enabled", True),
                     "fiammetta_recovery_enabled": True
                 })
@@ -1117,7 +1240,7 @@ def run_task(task_type="daily", extra_args=None):
                 "facility": ["Mfg", "Trade", "Control", "Power", "Reception", "Office", "Dorm", "Processing"],
                 "mode": 10000,
                 "filename": infrast_file, "plan_index": plan_idx, "drones": "Money", "threshold": 50,
-                "dorm_not_stationed_enabled": True
+                "dorm_not_stationed_enabled": False
             })
     
         elif task_type == "fight":
@@ -1197,8 +1320,11 @@ def run_task(task_type="daily", extra_args=None):
         if task_type == "daily":
             try:
                 inv = account.get("inventory", {})
-                sub = f"【明日方舟托管简报】{account.get('name')} 日常流水线完成"
-                md = f"### 明日方舟每日托管执行完成\n- **账号**: {account.get('name')} ({account.get('platform', 'Official')})\n- **完成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n- **合成玉**: {inv.get('合成玉', '--')}\n- **至纯源石**: {inv.get('至纯源石', '--')}\n- **龙门币**: {inv.get('龙门币', '--')}\n- **固源岩**: {inv.get('固源岩', '--')}\n- **退出策略**: {account.get('on_complete', 'stop_emu')}"
+                is_failed = bool(FAILED_TASKCHAINS)
+                status_word = "部分失败" if is_failed else "执行完成"
+                sub = f"【明日方舟托管简报】{account.get('name')} 日常流水线{status_word}"
+                failed_detail = f"\n- **失败任务**: {', '.join(FAILED_TASKCHAINS)}" if is_failed else ""
+                md = f"### 明日方舟每日托管{status_word}\n- **账号**: {account.get('name')} ({account.get('platform', 'Official')})\n- **完成时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}{failed_detail}\n- **合成玉**: {inv.get('合成玉', '--')}\n- **至纯源石**: {inv.get('至纯源石', '--')}\n- **龙门币**: {inv.get('龙门币', '--')}\n- **固源岩**: {inv.get('固源岩', '--')}\n- **退出策略**: {account.get('on_complete', 'stop_emu')}"
                 notifier.dispatch_account_notify(account, sub, md, event_type="on_daily_summary")
             except Exception:
                 pass
