@@ -1328,7 +1328,7 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         /* 模态框样式与开闭状态 */
-        #modal-new-account, #modal-rename-account, #modal-img-viewer, #modal-add-maa-task {
+        #modal-new-account, #modal-rename-account, #modal-img-viewer, #modal-add-maa-task, #modal-notify-config {
             display: none;
             position: fixed;
             top: 0; left: 0; width: 100vw; height: 100vh;
@@ -1339,7 +1339,7 @@ APP_PAGE = """<!DOCTYPE html>
             justify-content: center;
             padding: 20px;
         }
-        #modal-new-account.show, #modal-rename-account.show, #modal-img-viewer.show, #modal-add-maa-task.show {
+        #modal-new-account.show, #modal-rename-account.show, #modal-img-viewer.show, #modal-add-maa-task.show, #modal-notify-config.show {
             display: flex !important;
         }
 
@@ -1347,6 +1347,7 @@ APP_PAGE = """<!DOCTYPE html>
         [data-theme="light"] #modal-rename-account,
         [data-theme="light"] #modal-img-viewer,
         [data-theme="light"] #modal-add-maa-task,
+        [data-theme="light"] #modal-notify-config,
             background: rgba(32, 33, 36, 0.65) !important;
         }
 
@@ -2309,6 +2310,62 @@ APP_PAGE = """<!DOCTYPE html>
             <div style="display: flex; gap: 10px; margin-top: 8px;">
                 <button class="btn-primary" onclick="submitRenameAccount()">保存名称</button>
                 <button class="btn-action" style="flex: 1;" onclick="closeRenameModal()">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 账号通知渠道配置模态框 -->
+    <div id="modal-notify-config" style="display: none;">
+        <div class="modal-box" style="max-width: 520px; max-height: 88vh; overflow-y: auto;">
+            <h2>🔔 通知渠道设置</h2>
+            <p>为该托管账号独立配置消息推送渠道，配置互相隔离</p>
+            <input type="hidden" id="notifyAccId" />
+            <div style="font-size: 12px; color: var(--claude-text-muted); margin-bottom: 10px;">
+                当前账号：<span id="notifyAccName" style="color: var(--claude-clay); font-weight: 600;">--</span>
+            </div>
+
+            <div class="form-row">
+                <span>通知方式</span>
+                <select id="cfgNotifyChannel" onchange="toggleNotifyUI(this.value)">
+                    <option value="none">关闭通知 (不推送)</option>
+                    <option value="wxpusher">仅使用 WxPusher 微信推送</option>
+                    <option value="email">仅使用 SMTP 邮箱推送</option>
+                    <option value="both">同时使用 WxPusher 与 邮箱推送</option>
+                </select>
+            </div>
+
+            <div id="notify-wx-box" style="margin-top: 8px; padding: 10px; background: var(--claude-surface-inset); border-radius: 8px; border: 1px solid var(--claude-border-subtle); display: none;">
+                <div style="font-size: 12px; font-weight: 600; color: var(--claude-text-main); margin-bottom: 4px;">WxPusher 配置</div>
+                <label style="font-size: 11px; color: var(--claude-text-dim);">应用 AppToken (支持 SPT_ 极简Token 或 AT_ 标准Token)</label>
+                <input type="text" id="cfgWxToken" class="form-input" placeholder="留空使用默认，或填 SPT_xxxx / AT_xxxx" />
+                <label style="font-size: 11px; color: var(--claude-text-dim);">目标接收 UID (仅 AT_ 时需要，逗号隔开；SPT_留空)</label>
+                <input type="text" id="cfgWxUids" class="form-input" placeholder="例如: UID_a1b2c3d4e5" />
+            </div>
+
+            <div id="notify-email-box" style="margin-top: 8px; padding: 10px; background: var(--claude-surface-inset); border-radius: 8px; border: 1px solid var(--claude-border-subtle); display: none;">
+                <div style="font-size: 12px; font-weight: 600; color: var(--claude-text-main); margin-bottom: 4px;">SMTP 邮箱配置 (授权码模式)</div>
+                <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 6px;">
+                    <div>
+                        <label style="font-size: 11px; color: var(--claude-text-dim);">SMTP 服务器地址</label>
+                        <input type="text" id="cfgEmailHost" class="form-input" placeholder="例如: smtp.qq.com" />
+                    </div>
+                    <div>
+                        <label style="font-size: 11px; color: var(--claude-text-dim);">端口</label>
+                        <input type="number" id="cfgEmailPort" class="form-input" value="465" />
+                    </div>
+                </div>
+                <label style="font-size: 11px; color: var(--claude-text-dim);">发件邮箱账号</label>
+                <input type="text" id="cfgEmailSender" class="form-input" placeholder="例如: your_qq@qq.com" />
+                <label style="font-size: 11px; color: var(--claude-text-dim);">发件邮箱授权码 (16位独立服务授权码)</label>
+                <input type="password" id="cfgEmailAuth" class="form-input" placeholder="邮箱服务商生成的授权码" />
+                <label style="font-size: 11px; color: var(--claude-text-dim);">收件人邮箱</label>
+                <input type="text" id="cfgEmailReceiver" class="form-input" placeholder="接收通知的邮箱地址" />
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 14px;">
+                <button class="btn-primary" style="flex: 1;" onclick="saveNotifyFromModal()">💾 保存通知设置</button>
+                <button class="btn-action" onclick="testNotifyFromModal()">📨 测试发送</button>
+                <button class="btn-action" onclick="closeNotifyModal()">取消</button>
             </div>
         </div>
     </div>
@@ -3419,6 +3476,7 @@ APP_PAGE = """<!DOCTYPE html>
                             <span>${escapeHtml(acc.name)}</span>
                             <span class="badge">${acc.platform === 'Bilibili' ? 'B服' : '官服'}</span>
                             <button class="btn-action" style="padding: 2px 8px; font-size: 11px;" onclick="openRenameModal('${acc.id}', '${acc.name}')">✎ 改名</button>
+                            <button class="btn-action" style="padding: 2px 8px; font-size: 11px;" onclick="openNotifyModal('${acc.id}')">🔔 通知</button>
                         </div>
                         <div style="font-size: 12px; color: var(--claude-text-muted);">
                             账号标识: <span style="font-family: monospace; color: var(--claude-text-main);">${acc.account_name || '未填'}</span> · 
@@ -3831,36 +3889,132 @@ APP_PAGE = """<!DOCTYPE html>
 
 
         
-                function toggleNotifyUI(ch) {
+        function toggleNotifyUI(ch) {
             const wxBox = document.getElementById('notify-wx-box');
             const emBox = document.getElementById('notify-email-box');
             if (wxBox) wxBox.style.display = (ch === 'wxpusher' || ch === 'both') ? 'block' : 'none';
             if (emBox) emBox.style.display = (ch === 'email' || ch === 'both') ? 'block' : 'none';
         }
 
-        function testNotifyConfig() {
-            const acc = getCurrentAccount();
-            if (!acc.id) return;
-            const ch = document.getElementById('cfgNotifyChannel').value;
-            if (ch === 'none') {
+        // --- 账号通知渠道配置模态框 ---
+        function openNotifyModal(accId) {
+            const acc = (GLOBAL_ACCOUNTS_DATA.accounts || []).find(a => a.id === accId);
+            if (!acc) return;
+            document.getElementById('notifyAccId').value = acc.id;
+            safeSetText('notifyAccName', acc.name || '--');
+
+            const notify = acc.notify || {};
+            const ch = notify.channel || 'none';
+            safeSetVal('cfgNotifyChannel', ch);
+            toggleNotifyUI(ch);
+
+            const wx = notify.wxpusher || {};
+            safeSetVal('cfgWxToken', wx.app_token || '');
+            safeSetVal('cfgWxUids', (wx.uids || []).join(', '));
+
+            const em = notify.email || {};
+            safeSetVal('cfgEmailHost', em.smtp_host || 'smtp.qq.com');
+            safeSetVal('cfgEmailPort', em.smtp_port || 465);
+            safeSetVal('cfgEmailSender', em.sender_email || '');
+            safeSetVal('cfgEmailAuth', em.auth_code || '');
+            safeSetVal('cfgEmailReceiver', em.receiver_email || '');
+
+            const m = document.getElementById('modal-notify-config');
+            if (m) {
+                m.classList.add('show');
+                m.style.display = 'flex';
+            }
+        }
+
+        function closeNotifyModal() {
+            const m = document.getElementById('modal-notify-config');
+            if (m) {
+                m.classList.remove('show');
+                m.style.display = 'none';
+            }
+        }
+
+        // 仅收集通知字段，避免动到其它账号配置
+        function collectNotifyConfig() {
+            const getElVal = (id, defVal) => {
+                const el = document.getElementById(id);
+                return el ? el.value : defVal;
+            };
+            const notify = {
+                channel: getElVal('cfgNotifyChannel', 'none'),
+                triggers: {
+                    on_6star_recruit: true,
+                    on_daily_summary: true,
+                    on_error: true
+                },
+                wxpusher: {
+                    app_token: getElVal('cfgWxToken', '').trim(),
+                    uids: getElVal('cfgWxUids', '').split(',').map(s => s.trim()).filter(Boolean),
+                    topic_ids: []
+                },
+                email: {
+                    smtp_host: getElVal('cfgEmailHost', 'smtp.qq.com').trim(),
+                    smtp_port: parseInt(getElVal('cfgEmailPort', '465')) || 465,
+                    use_ssl: true,
+                    sender_email: getElVal('cfgEmailSender', '').trim(),
+                    auth_code: getElVal('cfgEmailAuth', '').trim(),
+                    receiver_email: getElVal('cfgEmailReceiver', '').trim()
+                }
+            };
+            return notify;
+        }
+
+        function persistNotifyConfig(accId, notify, onDone) {
+            const acc = (GLOBAL_ACCOUNTS_DATA.accounts || []).find(a => a.id === accId);
+            if (!acc) { alert('账号不存在'); return; }
+            acc.notify = notify;
+            fetch('/api/accounts/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({account: acc})
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    if (onDone) onDone();
+                } else {
+                    alert('保存失败: ' + (res.error || ''));
+                }
+            }).catch(e => alert('请求异常: ' + e));
+        }
+
+        function saveNotifyFromModal() {
+            const accId = document.getElementById('notifyAccId').value;
+            if (!accId) return;
+            persistNotifyConfig(accId, collectNotifyConfig(), () => {
+                closeNotifyModal();
+                renderCurrentAccountDetails();
+            });
+        }
+
+        function testNotifyFromModal() {
+            const accId = document.getElementById('notifyAccId').value;
+            if (!accId) return;
+            const notify = collectNotifyConfig();
+            if (notify.channel === 'none') {
                 alert('请先将通知方式切换为 WxPusher 或 邮箱，再进行测试发送！');
                 return;
             }
-            if (!confirm(`将使用当前界面填写的凭据向账号 ${acc.name} 发送测试消息，确定吗？`)) return;
-            
-            // 先临时提交当前通知配置
-            saveCurrentConfig();
-            
-            fetch('/api/notify/test', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({account_id: acc.id})
-            }).then(r => r.json()).then(res => {
-                alert('测试推送结果: ' + JSON.stringify(res.results || res));
-            }).catch(e => {
-                alert('请求异常: ' + e);
+            const acc = (GLOBAL_ACCOUNTS_DATA.accounts || []).find(a => a.id === accId);
+            if (!confirm(`将使用当前界面填写的凭据向账号 ${acc ? acc.name : accId} 发送测试消息，确定吗？`)) return;
+
+            // 先落盘，再用落盘后的配置发测试
+            persistNotifyConfig(accId, notify, () => {
+                fetch('/api/notify/test', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({account_id: accId})
+                }).then(r => r.json()).then(res => {
+                    alert('测试推送结果: ' + JSON.stringify(res.results || res));
+                }).catch(e => alert('请求异常: ' + e));
             });
         }
+
+        // 兼容旧调用名
+        function testNotifyConfig() { testNotifyFromModal(); }
 
         function submitNewAccount() {
             const name = document.getElementById('newAccName').value.trim();
