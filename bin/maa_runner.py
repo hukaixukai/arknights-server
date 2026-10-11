@@ -54,6 +54,9 @@ DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
 MAA_DIR = BASE_DIR / "maa"
 PYTHON_DIR = MAA_DIR / "Python"
 INFRAST_DIR = MAA_DIR / "infrast"
+# MAA 资源增量覆盖目录：用于修正上游 MaaResource 与当前游戏 UI 失配的资源。
+# 该目录独立于 maa/resource/，每日 update_maa.sh 覆盖基准资源时不会清除它。
+MAA_RESOURCE_OVERRIDE_DIR = MAA_DIR / "resource_override"
 CONFIG_DIR = BASE_DIR / "config"
 ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"
 DEPOT_FILE = MAA_DIR / "data" / "DepotData.json"
@@ -435,10 +438,14 @@ def update_account_inventory(data_json):
 CURRENT_RECRUIT_CONFIRMED = 0
 CURRENT_ASST_INSTANCE = None
 FAILED_TASKCHAINS = set()
+# 账号切换失败计数：MAA 的 AccountSwitchTask 失败后会重跑整条 StartUp，
+# 每次都会重启客户端。若不设上限，遇到 UI 失配会无限重启直至 OOM。
+ACCOUNT_SWITCH_FAILURES = 0
+ACCOUNT_SWITCH_FAILURE_LIMIT = 3
 
 @Asst.CallBackType
 def log_callback(msg, details, arg):
-    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE
+    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE, ACCOUNT_SWITCH_FAILURES
     m = Message(msg)
     try:
         d = json.loads(details.decode('utf-8'))
@@ -459,6 +466,19 @@ def log_callback(msg, details, arg):
                         CURRENT_ASST_INSTANCE.stop()
                     except Exception:
                         pass
+
+    # 账号切换硬护栏：AccountSwitchTask 反复失败会不断重启客户端直至 OOM。
+    # 达到阈值即强制 stop，交由上层按失败处理，绝不无限重试。
+    if m.name == "SubTaskError" and isinstance(d, dict) and d.get("subtask") == "AccountSwitchTask":
+        ACCOUNT_SWITCH_FAILURES += 1
+        print(f"[!] 账号切换失败 ({ACCOUNT_SWITCH_FAILURES}/{ACCOUNT_SWITCH_FAILURE_LIMIT})")
+        if ACCOUNT_SWITCH_FAILURES >= ACCOUNT_SWITCH_FAILURE_LIMIT:
+            print("[!] 账号切换连续失败达上限，强制中止任务链，防止无限重启客户端导致 OOM！")
+            if CURRENT_ASST_INSTANCE:
+                try:
+                    CURRENT_ASST_INSTANCE.stop()
+                except Exception:
+                    pass
 
     # 捕获公招开槽确认并统计今日已消耗数量
     if isinstance(d, dict) and d.get("taskchain") == "Recruit":
@@ -999,6 +1019,54 @@ def switch_game_profile(account_or_id):
     # 触屏切换交由 MAA StartUp 完成，这里恒返回 True（切换失败由 MAA 任务链反馈）
     return True
 
+def _maa_resource_override_tasks():
+    """
+    返回需要增量覆盖的 MAA 任务定义。
+
+    背景：游戏 2.7.81 在登录界面底部新增了「扫码登录」按钮，使「账号管理」由第 3 格
+    左移一格。上游 MaaResource 的 AccountManager.roi=[855,660,150,40] 恰好落在
+    「查看公告」上，导致模板始终只能匹配到 0.71 分而被判失败，AccountSwitchTask
+    反复重启客户端直至 OOM。这里用整条底部按钮栏的大 ROI 覆盖，既修正当前错位，
+    也能容忍未来按钮横向再微调。
+    """
+    return {
+        "AccountManager": {
+            "action": "ClickSelf",
+            "algorithm": "MatchTemplate",
+            "roi": [430, 650, 720, 70],
+            "next": ["LoginOther"],
+        }
+    }
+
+
+def ensure_maa_resource_override():
+    """
+    确保 MAA 增量资源覆盖目录存在且内容最新，返回可用的覆盖目录路径 (不可用时返回 None)。
+
+    MAA 的 Asst.load(path, incremental_path) 会把 incremental_path 当作与 path 同构的
+    资源根再次加载，同名任务以后者覆盖前者。因此覆盖目录需保持 <root>/resource/tasks/tasks.json
+    的层级结构。
+    """
+    try:
+        tasks_dir = MAA_RESOURCE_OVERRIDE_DIR / "resource" / "tasks"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        target = tasks_dir / "tasks.json"
+        payload = json.dumps(_maa_resource_override_tasks(), ensure_ascii=False, indent=4)
+        old = None
+        if target.exists():
+            try:
+                old = target.read_text(encoding="utf-8")
+            except Exception:
+                old = None
+        if old != payload:
+            target.write_text(payload, encoding="utf-8")
+            print(f"[+] 已写入 MAA 资源覆盖补丁: {target}")
+        return MAA_RESOURCE_OVERRIDE_DIR
+    except Exception as e:
+        print(f"[!] 写入 MAA 资源覆盖补丁失败 ({e})，将使用上游原始资源。")
+        return None
+
+
 def run_task(task_type="daily", extra_args=None):
     global CURRENT_ACCOUNT_DATA
     if extra_args is None:
@@ -1016,9 +1084,10 @@ def run_task(task_type="daily", extra_args=None):
         return False
 
     CURRENT_ACCOUNT_DATA = account
-    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE
+    global CURRENT_RECRUIT_CONFIRMED, FAILED_TASKCHAINS, CURRENT_ASST_INSTANCE, ACCOUNT_SWITCH_FAILURES
     CURRENT_RECRUIT_CONFIRMED = 0
     FAILED_TASKCHAINS = set()
+    ACCOUNT_SWITCH_FAILURES = 0
     mark_running_task(account, True)
 
     try:
@@ -1055,7 +1124,12 @@ def run_task(task_type="daily", extra_args=None):
         load_owned_6stars(account.get("id"))
     
         print(f"[*] 正在初始化 MAA 官方核心引擎: {MAA_DIR}")
-        Asst.load(path=MAA_DIR)
+        resource_override = ensure_maa_resource_override()
+        if resource_override:
+            print(f"[+] 已启用 MAA 资源增量覆盖: {resource_override} (修正登录界面账号管理按钮 ROI)")
+            Asst.load(path=MAA_DIR, incremental_path=resource_override)
+        else:
+            Asst.load(path=MAA_DIR)
         asst = Asst(callback=log_callback)
         CURRENT_ASST_INSTANCE = asst
     
