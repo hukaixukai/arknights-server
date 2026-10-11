@@ -1,3 +1,5 @@
+import select
+import threading
 import os
 import sys
 import json
@@ -13,6 +15,7 @@ import pathlib
 import datetime
 import subprocess
 import urllib.parse
+import urllib.request
 import http.server
 import socketserver
 
@@ -21,8 +24,16 @@ BIN_DIR = BASE_DIR / "bin"
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
+# 统一时区为北京时间 (游戏日 04:00 刷新、日志日期、调度展示均以此为准)
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except Exception:
+    pass
+
 import db
 import scheduler_guard
+import maa_config_adapter
 
 DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
 # 会话签名密钥：优先取环境变量；未设置时退化为进程级随机值（重启后登录态失效，属预期）
@@ -71,16 +82,141 @@ def find_adb():
 
 PORT = int(os.environ.get("PORT", 8090))
 ADB = os.getenv("ADB_BIN", find_adb())
-DEVICE = os.getenv("ADB_TARGET", "127.0.0.1:5555")
+def get_live_device():
+    try:
+        out = subprocess.check_output([ADB, "devices"], text=True)
+        devices = [l.split()[0] for l in out.splitlines() if "\tdevice" in l]
+        if "emulator-5554" in devices: return "emulator-5554"
+        if "127.0.0.1:5555" in devices: return "127.0.0.1:5555"
+        if devices: return devices[0]
+    except Exception:
+        pass
+    return "127.0.0.1:5555"
+
+DEVICE = get_live_device()
 
 CONFIG_DIR = BASE_DIR / "config"
 ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"
+MAA_DIR = BASE_DIR / "maa"
 INFRAST_DIR = BASE_DIR / "maa" / "infrast"
 DEPOT_FILE = BASE_DIR / "maa" / "data" / "DepotData.json"
 DEBUG_DIR = BASE_DIR / "maa" / "debug"
 LOG_FILE = DEBUG_DIR / "asst.log"
 RUNNER_SCRIPT = BASE_DIR / "bin" / "maa_runner.py"
 COMPOSE_FILE = BASE_DIR / "docker-compose.yml"
+# 容器由 compose 项目 arknights 创建；/app 目录默认项目名会变成 "app"，导致
+# docker compose stop/up 静默失效 (模拟器停不掉)。显式指定项目名修复。
+COMPOSE_PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "arknights")
+
+def compose_cmd(*args):
+    return ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", str(COMPOSE_FILE)] + list(args)
+
+def emulator_running():
+    """检测 redroid 模拟器容器是否在运行 (供智能退出策略使用)。"""
+    try:
+        out = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{.State.Running}}", "redroid_arknights"],
+            text=True, stderr=subprocess.DEVNULL, timeout=8)
+        return out.strip() == "true"
+    except Exception:
+        return False
+
+_EMULATOR_OP_LOCK = threading.Lock()
+
+def start_emulator_blocking(timeout_sec=90):
+    """
+    启动 redroid 模拟器并等待系统就绪 + ADB 连接 + 校准时区。
+    带全局互斥锁，防止与 stop/其他 start 竞态。返回 (ok, message)。
+    """
+    with _EMULATOR_OP_LOCK:
+        if emulator_running():
+            # 已运行：仅确认 ADB 连接即可
+            try:
+                subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            except Exception:
+                pass
+            return True, "模拟器已在运行"
+        try:
+            subprocess.run(compose_cmd("up", "-d", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except Exception as e:
+            return False, f"启动容器失败: {e}"
+        # 等待 boot_completed + ADB 就绪 (处理 recreate 后常见 adb offline)
+        import time as _t
+        deadline = _t.time() + timeout_sec
+        adbd_restarted = False
+        while _t.time() < deadline:
+            try:
+                subprocess.run([ADB, "disconnect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                st = subprocess.run([ADB, "-s", DEVICE, "get-state"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=6).stdout.strip()
+                if st != "device":
+                    if not adbd_restarted and _t.time() > deadline - timeout_sec + 15:
+                        subprocess.run(["docker", "exec", "redroid_arknights", "sh", "-c",
+                                        "setprop service.adb.tcp.port 5555; stop adbd; start adbd"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                        adbd_restarted = True
+                        _t.sleep(4)
+                    _t.sleep(2)
+                    continue
+                boot = subprocess.run([ADB, "-s", DEVICE, "shell", "getprop", "sys.boot_completed"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=6).stdout.strip()
+                if boot == "1":
+                    subprocess.run([ADB, "-s", DEVICE, "root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    _t.sleep(2)
+                    subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                    # 校准时区为北京时间
+                    subprocess.run([ADB, "-s", DEVICE, "shell", "setprop", "persist.sys.timezone", "Asia/Shanghai"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                    subprocess.run([ADB, "-s", DEVICE, "shell", "setprop", "ro.boot.timezone", "Asia/Shanghai"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+                    return True, "模拟器已启动并就绪"
+            except Exception:
+                pass
+            _t.sleep(2)
+        return False, "模拟器启动超时，请稍后重试"
+
+def stop_emulator_blocking():
+    """停止 redroid 模拟器 (带全局互斥锁)。返回 (ok, message)。"""
+    with _EMULATOR_OP_LOCK:
+        try:
+            subprocess.run([ADB, "-s", DEVICE, "shell", "am", "force-stop", "com.hypergryph.arknights"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        except Exception:
+            pass
+        try:
+            subprocess.run(compose_cmd("stop", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            subprocess.run([ADB, "disconnect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            return True, "模拟器已停止"
+        except Exception as e:
+            return False, str(e)
+
+def get_copilot_jobs_list(username=None):
+    """仅返回用户私有上传的作业（已彻底移除内置作业库预设）。"""
+    categories = []
+    user_uploads = []
+    u_dir = BASE_DIR / "data" / "copilot_uploads"
+    if username:
+        owner_dir = u_dir / username
+        if owner_dir.exists():
+            for f in sorted(owner_dir.glob("*.json")):
+                try:
+                    with open(f, "r", encoding="utf-8") as jf:
+                        meta = json.load(jf)
+                    doc = meta.get("doc", {}) if isinstance(meta, dict) else {}
+                    user_uploads.append({
+                        "filename": f.name,
+                        "title": doc.get("title") or f.stem,
+                        "details": doc.get("details", ""),
+                        "category": "我的上传",
+                        "is_user": True
+                    })
+                except Exception:
+                    user_uploads.append({"filename": f.name, "title": f.stem, "details": "", "category": "我的上传", "is_user": True})
+
+    if user_uploads:
+        categories.append({"name": "我的专属作业", "items": user_uploads})
+
+    return categories
 
 def adb_cmd(args):
     cmd = [ADB, "-s", DEVICE] + args
@@ -96,54 +232,122 @@ def is_emulator_alive():
 
 RUNNING_TASK_FILE = CONFIG_DIR / "running_task.json"
 
-def get_running_task_info():
-    task = db.get_running_task()
-    if task and task.get("running") and is_task_running():
-        return task
-    if is_task_running():
-        acc = db.get_account(db.get_active_account_id())
-        if acc:
-            return {
-                "running": True,
-                "account_id": acc.get("id"),
-                "account_name": acc.get("name"),
-                "owner_username": acc.get("owner_username", DEFAULT_ADMIN_USER)
-            }
-    return None
+def resolve_active_account_for_user(cur_user, explicit_acc_id=None):
+    """
+    解析请求对应的有效账号 ID，实现多用户隔离：
+    - 显式指定时直接使用 (越权校验交由各 endpoint 完成)
+    - 未指定时：管理员取全局激活账号；普通用户取其自身维度的激活账号
+    """
+    if explicit_acc_id:
+        return explicit_acc_id
+    if cur_user and cur_user.get("role") != "admin":
+        return db.get_active_account_id(owner_username=cur_user.get("username"))
+    return db.get_active_account_id()
 
-def is_task_running():
+def get_current_taskchain():
+    """从 MAA asst.log 尾部读取当前正在执行的 taskchain (供网页实时展示)。"""
+    try:
+        if not LOG_FILE.exists():
+            return ""
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            tail = f.read().decode("utf-8", "ignore")
+        matches = re.findall(r'"taskchain"\s*:\s*"([A-Za-z]+)"', tail)
+        if matches:
+            return matches[-1]
+    except Exception:
+        pass
+    return ""
+
+
+def get_running_task_info():
+    """
+    权威托管状态：以「真实 maa_runner.py 进程」为准。
+    - 若 DB 标记 running 但已无 runner 进程 (容器重启/异常退出留下脏状态)，自动清理并返回 None；
+    - 若存在 runner 进程，返回其账号/归属信息。
+    """
+    real_running = is_task_running()
+    task = db.get_running_task()
+    if not real_running:
+        # 清理脏状态，避免"明明没在跑却显示托管中"
+        if task and task.get("running"):
+            try:
+                db.set_running_task({"running": False})
+            except Exception:
+                pass
+        return None
+    if task and task.get("running") and task.get("account_id"):
+        return task
+    acc = db.get_account(db.get_active_account_id())
+    if acc:
+        return {
+            "running": True,
+            "account_id": acc.get("id"),
+            "account_name": acc.get("name"),
+            "owner_username": acc.get("owner_username", DEFAULT_ADMIN_USER)
+        }
+    return {"running": True, "account_id": "", "account_name": "", "owner_username": ""}
+
+RUNNER_LOCK_PATH = "/tmp/ark_runner.lock"
+
+def _iter_runner_pids():
+    """
+    精确列出正在执行的 maa_runner.py 进程 PID。
+    仅当进程 argv[0] 是 python 解释器 且 argv[1] 以 maa_runner.py 结尾时才算命中，
+    避免 `pgrep -f maa_runner.py` 误匹配到命令行里含该字符串的 shell/包装进程。
+    """
+    pids = []
     try:
         for pid_dir in pathlib.Path("/proc").glob("[0-9]*"):
             try:
-                cmd = (pid_dir / "cmdline").read_bytes()
-                if b"maa_runner.py" in cmd:
-                    return True
+                raw = (pid_dir / "cmdline").read_bytes()
             except Exception:
                 continue
+            if not raw:
+                continue
+            parts = [p.decode("utf-8", "ignore") for p in raw.split(b"\x00") if p]
+            if len(parts) < 2:
+                continue
+            argv0 = os.path.basename(parts[0])
+            if "python" not in argv0:
+                continue
+            # argv[1] 应为 .../maa_runner.py
+            if any(os.path.basename(a) == "maa_runner.py" for a in parts[1:3]):
+                try:
+                    pids.append(int(pid_dir.name))
+                except Exception:
+                    continue
     except Exception:
         pass
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "maa_runner.py"], text=True)
-        return bool(out.strip())
-    except Exception:
-        return False
+    return pids
+
+def is_task_running():
+    """权威判定：存在真实 maa_runner.py 进程 (精确 argv 匹配)。"""
+    return len(_iter_runner_pids()) > 0
 
 def stop_task_process():
     stopped = False
+    for pid in _iter_runner_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+            stopped = True
+        except Exception:
+            continue
+    # 兜底：清理包装脚本中的 ark_service_ctl.sh / timeout 包装
     try:
         for pid_dir in pathlib.Path("/proc").glob("[0-9]*"):
             try:
-                cmd = (pid_dir / "cmdline").read_bytes()
-                if b"maa_runner.py" in cmd:
-                    pid = int(pid_dir.name)
-                    os.kill(pid, signal.SIGKILL)
-                    stopped = True
+                raw = (pid_dir / "cmdline").read_bytes()
             except Exception:
                 continue
-    except Exception:
-        pass
-    try:
-        subprocess.run(["pkill", "-9", "-f", "maa_runner.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if b"ark_service_ctl.sh" in raw:
+                try:
+                    os.kill(int(pid_dir.name), signal.SIGKILL)
+                    stopped = True
+                except Exception:
+                    pass
     except Exception:
         pass
     return stopped
@@ -160,39 +364,29 @@ def save_accounts(data):
     if active_id:
         db.set_active_account_id(active_id)
 
-def get_user_infrast_dir(username: str = None) -> pathlib.Path:
-    uname = (username or DEFAULT_ADMIN_USER).strip()
-    u_dir = INFRAST_DIR / uname
-    u_dir.mkdir(parents=True, exist_ok=True)
-    return u_dir
+def get_account_infrast_dir(account_id: str) -> pathlib.Path:
+    """每个方舟账号一个独立目录，仅保留一个基建排班文件。"""
+    aid = (account_id or "unknown").strip()
+    d = INFRAST_DIR / aid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-def list_infrast_plans(owner_username: str = None):
-    plans = set()
-    u_dir = get_user_infrast_dir(owner_username)
-    if u_dir.exists():
-        for p in u_dir.glob("*.json"):
-            plans.add(p.name)
-    # 仅超级管理员可查阅管理员专属私有排班
-    if owner_username == DEFAULT_ADMIN_USER or not owner_username:
-        h_dir = INFRAST_DIR / DEFAULT_ADMIN_USER
-        if h_dir.exists():
-            for p in h_dir.glob("*.json"):
-                plans.add(p.name)
-    return sorted(list(plans))
+def list_infrast_plans(account_id: str = None):
+    """返回该账号目录下的基建文件列表 (正常至多 1 个)。"""
+    if not account_id:
+        return []
+    d = get_account_infrast_dir(account_id)
+    return sorted(p.name for p in d.glob("*.json"))
 
-def parse_infrast_schedule_info(filename, owner_username: str = None):
+def parse_infrast_schedule_info(filename, account_id: str = None):
     filename = os.path.basename(filename)
     if not filename.endswith(".json"):
         filename += ".json"
-    
-    u_dir = get_user_infrast_dir(owner_username)
-    p = u_dir / filename
+    if not account_id:
+        return {"error": "File not found"}
+    p = get_account_infrast_dir(account_id) / filename
     if not p.exists():
-        # 仅超级管理员可查阅管理员专属私有排班，严禁其他普通用户穿透借读
-        if owner_username == DEFAULT_ADMIN_USER or not owner_username:
-            p = INFRAST_DIR / DEFAULT_ADMIN_USER / filename
-        if not p.exists():
-            return {"error": "File not found"}
+        return {"error": "File not found"}
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -235,6 +429,160 @@ def get_today_logs(owner_username=None, limit=250):
         return matched[-limit:]
     except Exception:
         return []
+
+def get_today_human_logs(limit=80):
+    events = []
+    running_task = is_task_running()
+    if not LOG_FILE.exists():
+        return []
+
+    task_meta = {
+        "StartUp": {"icon": "🎮", "name": "客户端唤醒与登录", "desc": "启动游戏客户端，验证登录并进入主界面大厅"},
+        "Recruit": {"icon": "📋", "name": "公开招募", "desc": "自动刷新词条并根据最优星级策略开槽招募"},
+        "Infrast": {"icon": "🏢", "name": "基建排班管理", "desc": "按排班表调配干员换班、无人机全额加速与产物收取"},
+        "Fight": {"icon": "⚔️", "name": "关卡作战 (理智清空)", "desc": "关卡作战完成，理智已全部清空结算"},
+        "Mall": {"icon": "🛒", "name": "信用商店消费", "desc": "宿舍信用已收取，完成每日优惠物资兑换"},
+        "Award": {"icon": "🎁", "name": "日常奖励与邮件", "desc": "完成日常任务见闻与邮件补给一键领取"},
+        "Depot": {"icon": "📦", "name": "仓库物资全量识别", "desc": "全量材料与龙门币库存识别完成并同步落盘"},
+    }
+
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+
+    sessions = []
+    curr_session = []
+    for l in lines:
+        if "MaaCore Process Start" in l or "StartGameTaskPlugin" in l:
+            if curr_session:
+                sessions.append(curr_session)
+                curr_session = []
+        curr_session.append(l)
+    if curr_session:
+        sessions.append(curr_session)
+
+    # 重点提炼最近的 1~2 轮会话
+    for s_idx, session_lines in enumerate(sessions[-2:]):
+        s_time = ""
+        s_status = {}
+        active_tc = None
+        recruit_extra = ""
+        infrast_extra = ""
+
+        for l in session_lines:
+            m_t = re.search(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", l)
+            t_str = m_t.group(1).split()[1] if m_t else ""
+            if not s_time and t_str:
+                s_time = t_str
+
+            if "TaskChainStart" in l:
+                m = re.search(r"\{.*\}", l)
+                if m:
+                    try:
+                        tc = json.loads(m.group(0)).get("taskchain")
+                        if tc in task_meta:
+                            active_tc = tc
+                            s_status[tc] = {"status": "running", "time": t_str, "extra": ""}
+                    except: pass
+            elif "TaskChainCompleted" in l:
+                m = re.search(r"\{.*\}", l)
+                if m:
+                    try:
+                        tc = json.loads(m.group(0)).get("taskchain")
+                        if tc in task_meta:
+                            s_status[tc] = {"status": "completed", "time": t_str, "extra": ""}
+                            if active_tc == tc:
+                                active_tc = None
+                    except: pass
+            elif "TaskChainError" in l:
+                m = re.search(r"\{.*\}", l)
+                if m:
+                    try:
+                        tc = json.loads(m.group(0)).get("taskchain")
+                        if tc in task_meta:
+                            s_status[tc] = {"status": "error", "time": t_str, "extra": "该任务执行超时或异常中断"}
+                            if active_tc == tc:
+                                active_tc = None
+                    except: pass
+            elif "RecruitTagsDetected" in l:
+                m = re.search(r"\{.*\}", l)
+                if m:
+                    try:
+                        tags = json.loads(m.group(0)).get("details", {}).get("tags", [])
+                        if tags:
+                            recruit_extra = f"识别标签: [{', '.join(tags)}]"
+                    except: pass
+            elif "RecruitConfirm" in l and "SubTaskCompleted" in l:
+                recruit_extra = (recruit_extra + " ➔ 锁定干员并确认开槽").strip()
+            elif "DroneAssistMfg" in l and "SubTaskCompleted" in l:
+                infrast_extra = "无人机加速制造完成，产物已收获"
+
+        is_latest_session = (s_idx == len(sessions[-2:]) - 1)
+        round_title = f"日常托管流水线 (启动时间: {s_time})" if s_time else "日常托管流水线"
+        all_completed = all(s_status.get(tc, {}).get("status") == "completed" for tc in ["StartUp", "Recruit", "Infrast", "Fight", "Mall", "Award", "Depot"] if tc in s_status)
+
+        if not any(e.get("title") == f"【运行批次】{round_title}" for e in events):
+            events.append({
+                "time": s_time,
+                "level": "info",
+                "icon": "🚀",
+                "title": f"【运行批次】{round_title}",
+                "desc": "全套日常任务链自动装配就绪"
+            })
+
+        for tc in ["StartUp", "Recruit", "Infrast", "Fight", "Mall", "Award", "Depot"]:
+            if tc in s_status:
+                info = s_status[tc]
+                st = info["status"]
+                t = info["time"]
+                meta = task_meta[tc]
+                
+                if st == "running" and (not is_latest_session or not running_task):
+                    st = "completed"
+
+                if st == "completed":
+                    desc = meta["desc"]
+                    if tc == "Recruit" and recruit_extra:
+                        desc = recruit_extra
+                    elif tc == "Infrast" and infrast_extra:
+                        desc = f"{desc} ({infrast_extra})"
+                    events.append({
+                        "time": t,
+                        "level": "success",
+                        "icon": "✔",
+                        "title": f"{meta['name']} 顺利完成",
+                        "desc": desc
+                    })
+                elif st == "running":
+                    events.append({
+                        "time": t,
+                        "level": "running",
+                        "icon": meta["icon"],
+                        "title": f"正在执行: {meta['name']}...",
+                        "desc": f"任务执行中: {meta['desc']}"
+                    })
+                elif st == "error":
+                    events.append({
+                        "time": t,
+                        "level": "error",
+                        "icon": "❌",
+                        "title": f"{meta['name']} 执行中断",
+                        "desc": info.get("extra") or "任务执行超时或异常中断"
+                    })
+
+        if all_completed and len(s_status) >= 5:
+            last_time = max([s_status[tc]["time"] for tc in s_status if s_status[tc]["time"]])
+            events.append({
+                "time": last_time,
+                "level": "success",
+                "icon": "🎉",
+                "title": "本轮全套日常任务 100% 顺利完成！",
+                "desc": "所有 7 项日常阶段均成功执行，模拟器已安全休眠释放系统资源"
+            })
+
+    return events[-limit:]
 
 def get_today_card_logs(owner_username=None):
     cards = []
@@ -830,8 +1178,101 @@ APP_PAGE = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>明日方舟多账号托管管理控制台</title>
+    <script src="/jmuxer.min.js"></script>
         <style>
         /* 1. 默认夜间主题: Anthropic Claude 暖石炭官方风格 */
+        .log-mode-switch {
+            display: inline-flex;
+            background: var(--claude-surface-inset);
+            border: 1px solid var(--claude-border);
+            border-radius: var(--radius-pill);
+            padding: 2px;
+            margin-left: 10px;
+        }
+        .log-mode-btn {
+            border: none;
+            background: transparent;
+            color: var(--claude-text-muted);
+            font-size: 11px;
+            font-weight: 500;
+            padding: 2px 8px;
+            border-radius: var(--radius-pill);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .log-mode-btn.active {
+            background: var(--claude-surface-hover);
+            color: var(--claude-clay);
+            font-weight: 600;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+        }
+        .human-log-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 4px;
+        }
+        .human-log-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 8px 12px;
+            background: #ffffff !important;
+            border: 1px solid #e1e4e8 !important;
+            border-radius: 6px;
+            transition: background 0.15s, border-color 0.15s;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+        }
+        .human-log-item:hover {
+            background: #f6f8fa !important;
+        }
+        .human-log-item.level-success {
+            border-left: 3px solid #2da44e !important;
+            background: #fbfdfc !important;
+        }
+        .human-log-item.level-running {
+            border-left: 3px solid #d97745 !important;
+            background: #fffcf8 !important;
+        }
+        .human-log-item.level-info {
+            border-left: 3px solid #0969da !important;
+            background: #fcfdfe !important;
+        }
+        .human-log-item.level-error {
+            border-left: 3px solid #cf222e !important;
+            background: #fff8f8 !important;
+        }
+        .human-log-time {
+            font-size: 11px;
+            font-family: var(--font-mono);
+            color: #6e7781 !important;
+            white-space: nowrap;
+            margin-top: 1px;
+        }
+        .human-log-icon {
+            font-size: 14px;
+            line-height: 1.2;
+        }
+        .human-log-content {
+            flex: 1;
+            min-width: 0;
+        }
+        .human-log-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #1f2328 !important;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .human-log-desc {
+            font-size: 11px;
+            color: #57606a !important;
+            margin-top: 2px;
+            line-height: 1.4;
+            word-break: break-all;
+        }
+
         :root {
             --claude-bg: #181816;
             --claude-surface: #22221f;
@@ -887,7 +1328,7 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         /* 模态框样式与开闭状态 */
-        #modal-new-account, #modal-rename-account, #modal-img-viewer {
+        #modal-new-account, #modal-rename-account, #modal-img-viewer, #modal-add-maa-task {
             display: none;
             position: fixed;
             top: 0; left: 0; width: 100vw; height: 100vh;
@@ -898,13 +1339,14 @@ APP_PAGE = """<!DOCTYPE html>
             justify-content: center;
             padding: 20px;
         }
-        #modal-new-account.show, #modal-rename-account.show, #modal-img-viewer.show {
+        #modal-new-account.show, #modal-rename-account.show, #modal-img-viewer.show, #modal-add-maa-task.show {
             display: flex !important;
         }
 
         [data-theme="light"] #modal-new-account,
         [data-theme="light"] #modal-rename-account,
-        [data-theme="light"] #modal-img-viewer {
+        [data-theme="light"] #modal-img-viewer,
+        [data-theme="light"] #modal-add-maa-task,
             background: rgba(32, 33, 36, 0.65) !important;
         }
 
@@ -991,6 +1433,68 @@ APP_PAGE = """<!DOCTYPE html>
             border-radius: var(--radius-md);
             border: 1px solid var(--claude-border);
             box-shadow: var(--shadow-subtle);
+        }
+
+        /* 全局托管状态徽标 */
+        .global-task-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 14px;
+            border-radius: var(--radius-pill);
+            font-size: 13px;
+            font-weight: 700;
+            background: var(--claude-surface);
+            border: 1px solid var(--claude-border);
+            box-shadow: var(--shadow-subtle);
+            white-space: nowrap;
+            transition: all 0.25s ease;
+            cursor: default;
+        }
+        .global-task-badge .gtb-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #94a3b8;
+            flex-shrink: 0;
+        }
+        .global-task-badge .gtb-elapsed {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 600;
+            opacity: 0.85;
+        }
+        .global-task-badge .gtb-stop {
+            margin-left: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            font-weight: 700;
+            border-radius: var(--radius-pill);
+            border: 1px solid var(--claude-danger);
+            background: rgba(217, 48, 37, 0.12);
+            color: var(--claude-danger);
+            cursor: pointer;
+        }
+        .global-task-badge .gtb-stop:hover { background: rgba(217, 48, 37, 0.25); }
+        .global-task-badge.state-running {
+            background: linear-gradient(135deg, rgba(217, 119, 69, 0.22), rgba(217, 119, 69, 0.10));
+            border-color: var(--claude-clay);
+            color: var(--claude-clay);
+            box-shadow: 0 0 0 1px rgba(217,119,69,0.25), 0 2px 10px rgba(217,119,69,0.25);
+        }
+        .global-task-badge.state-running .gtb-dot {
+            background: var(--claude-clay);
+            animation: gtb-pulse 1.1s ease-in-out infinite;
+        }
+        .global-task-badge.state-idle {
+            color: var(--claude-text-muted);
+        }
+        .global-task-badge.state-idle .gtb-dot {
+            background: #64748b;
+        }
+        @keyframes gtb-pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.3; transform: scale(0.65); }
         }
 
         .account-selector select {
@@ -1139,7 +1643,7 @@ APP_PAGE = """<!DOCTYPE html>
             justify-content: center;
         }
 
-        #screen {
+        #screen, #screen-video {
             width: 100%;
             height: 100%;
             object-fit: contain;
@@ -1150,6 +1654,8 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         .screen-offline-placeholder {
+            position: absolute;
+            top: 0; left: 0;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -1159,6 +1665,7 @@ APP_PAGE = """<!DOCTYPE html>
             background: rgba(18, 18, 16, 0.95);
             width: 100%;
             height: 100%;
+            z-index: 5;
         }
         .screen-offline-placeholder h3 {
             font-size: 17px;
@@ -1300,6 +1807,237 @@ APP_PAGE = """<!DOCTYPE html>
             box-shadow: 0 1px 3px rgba(0,0,0,0.15);
         }
 
+        .maa-desktop-panel {
+            display: flex;
+            flex-direction: column;
+            background: var(--claude-surface);
+            border: 1px solid var(--claude-border);
+            border-radius: var(--radius-lg);
+            padding: 12px;
+            box-shadow: var(--shadow-subtle);
+            min-height: 520px;
+        }
+        .maa-top-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--claude-border-subtle);
+            margin-bottom: 8px;
+        }
+        .maa-logo-badge {
+            display: inline-block;
+            background: var(--claude-clay);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 4px;
+            letter-spacing: 0.5px;
+        }
+        .maa-subnav {
+            display: flex;
+            gap: 4px;
+            background: var(--claude-surface-inset);
+            border: 1px solid var(--claude-border-subtle);
+            border-radius: 6px;
+            padding: 3px;
+            margin-bottom: 10px;
+        }
+        .maa-subnav-btn {
+            flex: 1;
+            border: none;
+            background: transparent;
+            color: var(--claude-text-muted);
+            font-size: 12px;
+            font-weight: 500;
+            padding: 6px 4px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.15s;
+            text-align: center;
+            white-space: nowrap;
+        }
+        .maa-subnav-btn:hover {
+            color: var(--claude-text-main);
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .maa-subnav-btn.active {
+            background: var(--claude-surface);
+            color: var(--claude-clay);
+            font-weight: 600;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+        }
+        .maa-subcontent {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+            padding-right: 2px;
+        }
+        .maa-action-bar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .maa-task-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-right: 4px;
+        }
+        
+        .maa-task-action-btn {
+            background: transparent;
+            border: 1px solid var(--claude-border-subtle);
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 11px;
+            color: var(--claude-text-muted);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .maa-task-action-btn:hover {
+            background: var(--claude-surface-hover);
+            color: var(--claude-text-main);
+            border-color: var(--claude-border);
+        }
+        .weekly-days-grid {
+            display: flex;
+            gap: 4px;
+            flex-wrap: wrap;
+            margin-top: 4px;
+        }
+        .weekly-day-chip {
+            padding: 2px 6px;
+            font-size: 11px;
+            border-radius: 4px;
+            border: 1px solid var(--claude-border-subtle);
+            background: var(--claude-surface);
+            color: var(--claude-text-dim);
+            cursor: pointer;
+            user-select: none;
+        }
+        .weekly-day-chip.active {
+            background: rgba(217, 119, 69, 0.2);
+            color: var(--claude-clay);
+            border-color: var(--claude-clay);
+            font-weight: 600;
+        }
+        .stage-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            font-size: 11px;
+            border-radius: 4px;
+            background: rgba(217, 119, 69, 0.15);
+            color: var(--claude-clay);
+            border: 1px solid var(--claude-clay);
+            font-family: var(--font-mono);
+        }
+        .stage-chip-x {
+            cursor: pointer;
+            font-size: 10px;
+            opacity: 0.7;
+        }
+        .stage-chip-x:hover { opacity: 1; }
+        .stage-select-chip {
+            display: inline-block;
+            padding: 3px 9px;
+            font-size: 11px;
+            border-radius: 4px;
+            background: var(--claude-surface);
+            color: var(--claude-text-main);
+            border: 1px solid var(--claude-border-subtle);
+            cursor: pointer;
+            font-family: var(--font-mono);
+            transition: all 0.15s;
+        }
+        .stage-select-chip:hover {
+            background: var(--claude-clay);
+            color: #fff;
+            border-color: var(--claude-clay);
+        }
+
+        .maa-task-card {
+            background: var(--claude-surface-inset);
+            border: 1px solid var(--claude-border);
+            border-radius: 6px;
+            overflow: hidden;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .maa-task-card:hover {
+            border-color: var(--claude-border-hover);
+        }
+        .maa-task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 10px;
+            user-select: none;
+        }
+        .maa-task-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .maa-task-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--claude-text-main);
+        }
+        .maa-task-desc {
+            font-size: 11px;
+            color: var(--claude-text-dim);
+            margin-left: 4px;
+        }
+        .maa-task-toggle {
+            cursor: pointer;
+            accent-color: var(--claude-clay);
+            width: 16px;
+            height: 16px;
+        }
+        .maa-task-body {
+            padding: 10px 12px;
+            border-top: 1px solid var(--claude-border-subtle);
+            background: rgba(0, 0, 0, 0.15);
+            font-size: 12px;
+            display: none;
+        }
+        .maa-task-card.expanded .maa-task-body {
+            display: block;
+        }
+        .maa-task-expand-btn {
+            background: transparent;
+            border: none;
+            color: var(--claude-text-muted);
+            cursor: pointer;
+            padding: 2px 6px;
+            font-size: 11px;
+            border-radius: 4px;
+        }
+        .maa-task-expand-btn:hover {
+            color: var(--claude-clay);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .timer-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--claude-surface-inset);
+            border: 1px solid var(--claude-border-subtle);
+            border-radius: 6px;
+            padding: 8px 10px;
+            gap: 8px;
+        }
+        .touch-bar-container {
+            margin-top: 8px;
+            background: var(--claude-surface);
+            border: 1px solid var(--claude-border);
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+
         .form-row {
             display: flex;
             justify-content: space-between;
@@ -1338,6 +2076,48 @@ APP_PAGE = """<!DOCTYPE html>
             color: #3c4043 !important;
         }
 
+        /* 投屏三模式切换器 (分段控件) */
+        .screen-mode-switch {
+            display: inline-flex;
+            align-items: stretch;
+            background: var(--claude-surface);
+            border: 1px solid var(--claude-border);
+            border-radius: var(--radius-md);
+            padding: 2px;
+            gap: 2px;
+        }
+        .screen-mode-btn {
+            border: none;
+            background: transparent;
+            color: var(--claude-text-muted);
+            font-size: 12px;
+            font-weight: 600;
+            padding: 5px 12px;
+            border-radius: calc(var(--radius-md) - 2px);
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+            white-space: nowrap;
+        }
+        .screen-mode-btn:hover {
+            color: var(--claude-text-main);
+            background: rgba(127, 127, 127, 0.08);
+        }
+        .screen-mode-btn.active {
+            background: rgba(40, 167, 69, 0.18) !important;
+            color: #28a745 !important;
+            box-shadow: inset 0 0 0 1px rgba(40, 167, 69, 0.45) !important;
+        }
+        #modeBtnPoll.active {
+            background: rgba(64, 132, 214, 0.18) !important;
+            color: #4090d6 !important;
+            box-shadow: inset 0 0 0 1px rgba(64, 132, 214, 0.45) !important;
+        }
+        #modeBtnOff.active {
+            background: rgba(148, 163, 184, 0.22) !important;
+            color: #94a3b8 !important;
+            box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.45) !important;
+        }
+
         .inv-grid {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -1361,6 +2141,8 @@ APP_PAGE = """<!DOCTYPE html>
             width: 100%;
             max-width: 480px;
             padding: 24px;
+            max-height: 85vh;
+            overflow-y: auto;
             box-shadow: 0 16px 48px rgba(0,0,0,0.6);
         }
         .modal-box h2 {
@@ -1377,17 +2159,18 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         .log-terminal {
-            background: #0d0d0c;
-            border: 1px solid var(--claude-border);
+            background: #ffffff !important;
+            border: 1px solid #d0d7de !important;
             border-radius: var(--radius-md);
-            padding: 10px;
+            padding: 12px;
             font-size: 11px;
-            line-height: 1.5;
-            color: #81c784;
-            max-height: 140px;
+            line-height: 1.55;
+            color: #24292f !important;
+            min-height: 380px;
             overflow-y: auto;
             white-space: pre-wrap;
             word-break: break-all;
+            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
         }
 
         .account-card-item {
@@ -1478,13 +2261,8 @@ APP_PAGE = """<!DOCTYPE html>
         <div class="modal-box">
             <h2>添加新托管账号</h2>
             <p>配置新小号，实现单客户端无多开直接自动轮换托管</p>
-            <label style="font-size: 12px; color: var(--claude-text-muted);">明日方舟游戏账号</label>
-            <input type="text" id="newAccAccount" class="form-input" placeholder="例如 13800000000" oninput="autoSuggestName(this.value)" />
-            <label style="font-size: 12px; color: var(--claude-text-muted);">明日方舟游戏登录密码</label>
-            <div style="display: flex; gap: 6px; align-items: center;">
-                <input type="password" id="newAccGamePwd" class="form-input" placeholder="输入游戏登录密码..." autocomplete="current-password" style="margin-bottom: 0;" />
-                <button type="button" class="btn-action" style="padding: 8px 10px; font-size: 11px; white-space: nowrap;" onclick="togglePwdVisibility('newAccGamePwd')">👁 显隐</button>
-            </div>
+            <label style="font-size: 12px; color: var(--claude-text-muted);">游戏账号标识 (尾号/登录名)</label>
+            <input type="text" id="newAccAccount" class="form-input" placeholder="例如 8019（官服填尾号，B服填登录名）" oninput="autoSuggestName(this.value)" />
             <label style="font-size: 12px; color: var(--claude-text-muted);">账号备注名</label>
             <input type="text" id="newAccName" class="form-input" placeholder="例如 官服·尾号1234" />
             <label style="font-size: 12px; color: var(--claude-text-muted);">客户端服务器平台</label>
@@ -1492,40 +2270,30 @@ APP_PAGE = """<!DOCTYPE html>
                 <option value="Official">官方服</option>
                 <option value="Bilibili">Bilibili服</option>
             </select>
-            <label style="font-size: 12px; color: var(--claude-text-muted);">托管与排班模式</label>
-            <select id="newAccInfrastMode" class="form-input" onchange="toggleNewModalInfrastMode(this.value)">
-                <option value="custom_plan">📋 绑定单一基建排班文件</option>
-                <option value="daily_once">🔄 一天一登轮换模式</option>
-            </select>
-
-            <div id="new-modal-area-plan">
-                <label style="font-size: 12px; color: var(--claude-text-muted);">基建排班预设</label>
-                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px;">
-                    <select id="newAccInfrast" class="form-input" style="margin-bottom: 0; flex: 1; font-weight: 500;"></select>
-                    <button type="button" class="btn-action" style="padding: 7px 12px; font-size: 12px; white-space: nowrap; background: rgba(217, 119, 69, 0.15); color: var(--claude-clay); border-color: var(--claude-clay);" onclick="triggerInfrastUploadForNewModal()">📥 导入新排班</button>
-                </div>
-                <div style="font-size: 11px; color: var(--claude-text-dim); margin-top: 2px; margin-bottom: 12px;">说明：支持 MAA 官方排班 JSON 格式，导入后自动识别班次。</div>
-            </div>
-
-            <div id="new-modal-area-daily" style="display: none;">
-                <label style="font-size: 12px; color: var(--claude-text-muted);">无人机加速对象</label>
-                <select id="newAccDronesTarget" class="form-input" style="margin-bottom: 8px;">
-                    <option value="Money">龙门币</option>
-                    <option value="BattleRecord">经验书</option>
-                    <option value="Orundum">合成玉</option>
-                    <option value="OriginiumShard">源石碎片</option>
-                    <option value="PureGold">赤金</option>
-                </select>
-                <label style="font-size: 12px; color: var(--claude-text-muted);">每日单次运行时间</label>
-                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 4px;">
-                    <input type="time" id="newAccDailyTime" class="form-input" value="16:00" style="width: 140px; text-align: center; font-size: 13px; font-weight: bold; margin-bottom: 0;" onchange="updateNewModalDailyTime(this.value)" />
-                    <span id="new-modal-exclusive-badge" class="slot-pill" style="font-weight: bold;">16:00 ~ 16:59 独占</span>
-                </div>
-                <div style="font-size: 11px; color: var(--claude-text-dim); margin-top: 2px; margin-bottom: 12px;">说明：每天在设定时间执行 1 次全自动任务，独占 59 分钟，完成后休眠。</div>
+            <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border-subtle); border-radius: 6px; padding: 10px; margin-bottom: 12px; font-size: 12px; color: var(--claude-text-muted); line-height: 1.5;">
+                🔐 <b>登录与切换说明</b>：<br>
+                1. 请在左侧投屏解锁后用<b>触屏手动登录</b>该账号一次（无需填写密码，系统不保存任何游戏账密）；<br>
+                2. 之后切换账号由 MAA 通过触屏点击已登录账号列表完成，<b>不读写任何游戏配置文件</b>；<br>
+                3. 创建后将自动初始化 MAA 默认配置与每日定时班次 (10:00 / 16:00 / 22:00，每次 40 分钟独占)，可随时调整。
             </div>
             <div style="display: flex; gap: 10px; margin-top: 8px;">
                 <button class="btn-primary" onclick="submitNewAccount()">确认创建账号</button>
                 <button class="btn-action" style="flex: 1;" onclick="closeNewAccountModal()">取消</button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- 添加 MAA 任务模态框 -->
+    <div id="modal-add-maa-task" style="display: none;" onclick="closeAddMaaTaskModal()">
+        <div class="modal-box" style="max-width: 480px;" onclick="event.stopPropagation()">
+            <h2>➕ 添加 MAA 任务</h2>
+            <p>选择要加入一键长草队列的任务类型，加入后可自由配置参数与调整执行顺序。</p>
+            <div id="maa-add-task-catalog-list" style="display: flex; flex-direction: column; gap: 8px; margin: 12px 0; max-height: 360px; overflow-y: auto;">
+                <!-- 动态渲染任务类型目录 -->
+            </div>
+            <div style="display: flex; gap: 10px; margin-top: 10px;">
+                <button class="btn-action" style="flex: 1;" onclick="closeAddMaaTaskModal()">关闭取消</button>
             </div>
         </div>
     </div>
@@ -1559,6 +2327,13 @@ APP_PAGE = """<!DOCTYPE html>
             明日方舟多账号托管
         </div>
         <div class="header-right-tools" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <!-- 全局托管状态徽标 (所有页面常驻可见) -->
+            <div id="globalTaskBadge" class="global-task-badge" title="全局托管任务状态">
+                <span class="gtb-dot"></span>
+                <span class="gtb-text">状态检测中…</span>
+                <span class="gtb-elapsed" id="gtbElapsed" style="display:none;"></span>
+                <button type="button" class="gtb-stop" id="gtbStopBtn" style="display:none;" onclick="triggerTaskStop()">⏹ 停止</button>
+            </div>
             <div class="account-selector">
                 <span style="color: var(--claude-text-muted); font-size: 12px; font-weight: 500;">🎮 当前方舟账号:</span>
                 <select id="headerAccSelect" style="font-weight: 600; cursor: pointer;" onchange="changeActiveAccount(this.value)"></select>
@@ -1571,324 +2346,289 @@ APP_PAGE = """<!DOCTYPE html>
         </div>
     </header>
 
-    <!-- 导航切换 -->
+    <!-- 导航切换 (已精简合并策略至 MAA 桌面面板) -->
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('screen-tab')">🎮 实时交互投屏</button>
-        <button class="tab-btn" onclick="switchTab('config-tab')">⚙️ 托管账号策略</button>
         <button class="tab-btn" onclick="switchTab('account-tab')">👥 托管账号管理</button>
         <button class="tab-btn" onclick="switchTab('data-tab')">📊 物资与运行看板</button>
         <button class="tab-btn" id="tabBtnAdmin" style="display: none;" onclick="switchTab('admin-tab')">👑 管理员面板</button>
     </div>
 
-    <!-- TAB 1: 实时交互投屏与看板 (左栏投屏等比放大至 62%，右栏 38%，底端严格对齐) -->
+    <!-- TAB 1: 实时交互投屏与 MAA 桌面版原生小框面板 (左栏投屏等比 62%，右栏 MAA 38%，底端严格对齐) -->
     <div id="screen-tab" class="tab-content active">
         <div class="screen-split-layout">
             <!-- 左栏: 放大投屏大屏与控制 -->
             <div class="left-stream-col">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px;">
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <button type="button" class="btn-action" id="btnToggleScreenPoll" onclick="toggleScreenPolling()" style="padding: 5px 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px;">▶ 开启画面轮询 5秒</button>
-                        <button type="button" class="btn-action" onclick="refreshScreen(true)" style="padding: 5px 10px; font-size: 12px;">📸 手动抓拍一次</button>
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                        <div class="screen-mode-switch" id="screenModeSwitch">
+                            <button type="button" class="screen-mode-btn active" id="modeBtnStream" onclick="setScreenMode('30fps')" title="硬件编码 H.264 实时直通 (~30 帧/秒)，最低延迟">⚡ 30帧</button>
+                            <button type="button" class="screen-mode-btn" id="modeBtnPoll" onclick="setScreenMode('0.2fps')" title="每 5 秒抓取一次静态截图 (0.2 帧/秒)，极低资源占用">📸 0.2帧</button>
+                            <button type="button" class="screen-mode-btn" id="modeBtnOff" onclick="setScreenMode('off')" title="完全停止画面传输，零网络带宽与设备算力占用">⏹ 关闭</button>
+                        </div>
                     </div>
                     <div style="display: flex; align-items: center; gap: 6px; font-size: 12px;">
-                        <span id="screen-poll-status" class="badge" style="background: rgba(100,116,139,0.15); color: #94a3b8;">已暂停轮询 零资源占用</span>
+                        <span id="screen-poll-status" class="badge" style="background: rgba(40,167,69,0.15); color: #28a745; font-weight: bold;">🟢 30 FPS 硬件直通 · 延迟 &lt;30ms</span>
                     </div>
                 </div>
-                <div class="screen-card" id="container">
-                    <img id="screen" src="/screencap" alt="游戏画面加载中..." style="pointer-events: none; user-select: none; cursor: default;" />
+                <div class="screen-card" id="container" style="position: relative; overflow: hidden; border-radius: 8px; background: #000; pointer-events: none; user-select: none; cursor: default;">
+                    <video id="screen-video" autoplay muted playsinline style="display: block; width: 100%; height: auto; pointer-events: none; user-select: none; object-fit: contain;"></video>
+                    <img id="screen" src="/screencap" alt="游戏画面" style="display: none; width: 100%; height: auto; pointer-events: none; user-select: none;" />
                     <div class="screen-offline-placeholder" id="screen-offline" style="display: none;">
                         <h3>⏸ 模拟器休眠待命中</h3>
-                        <p>当前模拟器已停止以释放硬件资源。<br>可在右侧点击立即运行日常唤醒执行。</p>
+                        <p>当前模拟器已停止以释放硬件资源。<br>可在右侧点击 <b>▶ 开启模拟器</b> 唤醒，或直接 <b>▶ 启动长草队列</b>（会自动唤醒）。</p>
                     </div>
                     <div class="screen-offline-placeholder" id="screen-privacy" style="display: none; background: rgba(24, 24, 22, 0.95);">
-                        <h3 style="color: var(--claude-clay);">🔒 隐私保护屏蔽待命中</h3>
+                        <h3 style="color: var(--claude-clay);">🔒 其他账号占用中</h3>
                         <p>当前系统正在执行其他受邀用户的托管任务。<br>为保障用户隐私与账号安全，非本人账号执行期间画面已脱敏屏蔽。</p>
                     </div>
                 </div>
-                </div>
 
-            <!-- 右栏: 仿 MAA GUI 实时图文执行看板 (高度 100%，与左栏底端平齐) -->
-            <div class="dashboard-panel">
-                <div class="dash-control-bar">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span style="font-size: 12px; color: var(--claude-text-muted);">运行控制:</span>
-                            <span id="task-status-badge" style="font-size: 13px; font-weight: 600; margin-left: 6px; color: var(--claude-text-main);">检查中...</span>
+                <!-- 触控安全与文字注入工具条 (安全防误触 + 首次手动登录专用) -->
+                <div class="touch-bar-container">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span id="touchLockStatusBadge" class="badge" style="background: rgba(100, 116, 139, 0.15); color: #94a3b8; font-weight: bold;">🔒 屏幕触控已安全锁定</span>
+                            <button type="button" id="btnToggleTouch" class="btn-action" style="padding: 3px 10px; font-size: 12px; font-weight: 600;" onclick="toggleScreenTouch()">🔓 解锁屏幕触控</button>
                         </div>
-                        <div style="display: flex; gap: 8px;">
-                            <button class="dash-btn-run" id="btnRunDaily" onclick="triggerTaskRun()">▶ 立即运行日常</button>
-                            <button class="dash-btn-stop" id="btnStopTask" onclick="triggerTaskStop()">⏸ 强制停止任务</button>
-                            <button class="dash-btn-close-emu" onclick="triggerCloseEmu()">⏹ 停止模拟器</button>
+                        <div style="font-size: 11px; color: var(--claude-text-dim);">
+                            切换账号、离开或 5 分钟无操作将自动安全上锁 · 🔐 首次添加账号请解锁后触屏手动登录一次
                         </div>
                     </div>
-                </div>
-
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; margin-bottom: 8px;">
-                    <span style="color: var(--claude-clay); font-weight: 600;">📄 实时运行终端日志</span>
-                    <button type="button" class="btn-action" style="padding: 2px 8px; font-size: 11px;" onclick="loadTodayLogs()">⟳ 刷新日志</button>
-                </div>
-                <div class="log-terminal" id="logTerminal" style="flex: 1; min-height: 480px; overflow-y: auto;">正在读取今日运行日志...</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- TAB 2: 独立策略配置 -->
-    <div id="config-tab" class="tab-content">
-        <div class="grid-2">
-            <div class="card">
-                <div class="card-header">
-                    <span>基建排班与关卡作战</span>
-                </div>
-                <div class="form-row">
-                    <span>基建排班与托管模式</span>
-                    <select id="cfgInfrastMode" onchange="toggleInfrastModeUI(this.value)">
-                        <option value="custom_plan">📋 绑定单一基建排班文件</option>
-                        <option value="daily_once">🔄 一天一登轮换模式</option>
-                    </select>
-                </div>
-                <div id="area-custom-plan">
-                    <div class="form-row">
-                        <span>当前绑定的基建排班文件</span>
-                        <div style="display: flex; gap: 8px; align-items: center;">
-                            <select id="cfgInfrastPlan" onchange="loadInfrastPlanInfo(this.value)" style="font-weight: 600;"></select>
-                            <button type="button" class="btn-action" style="padding: 4px 10px; font-size: 12px; background: rgba(217, 119, 69, 0.15); color: var(--claude-clay); border-color: var(--claude-clay); white-space: nowrap;" onclick="triggerInfrastUpload()">📥 导入新排班替换</button>
-                            <button type="button" class="btn-action" style="padding: 4px 10px; font-size: 12px; color: var(--claude-danger); border-color: rgba(217, 48, 37, 0.35); background: rgba(217, 48, 37, 0.08); white-space: nowrap;" onclick="deleteCurrentInfrastPlan()">🗑️ 删除此排班</button>
-                        </div>
-                    </div>
-                    <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border); border-radius: 8px; padding: 12px; margin: 10px 0;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 12px; font-weight: 600; color: var(--claude-clay);">⏱ 排班表内置执行班次</span>
-                            <span id="plan-title-tag" style="font-size: 11px; color: var(--claude-text-dim);"></span>
-                        </div>
-                        <div id="plan-schedules-container" style="display: flex; flex-direction: column; gap: 6px;"></div>
+                    <!-- ADB 文本注入与虚拟按键栏 -->
+                    <div id="adbInputRow" style="display: flex; gap: 6px; align-items: center; margin-top: 8px;">
+                        <input type="text" id="adbTextInput" class="form-input" placeholder="输入要发送到模拟器的文字/手机号/密码..." style="flex: 1; margin-bottom: 0; font-size: 12px;" onkeydown="if(event.key==='Enter') sendAdbText();" />
+                        <button type="button" class="btn-action" style="padding: 6px 12px; font-size: 12px; white-space: nowrap;" onclick="sendAdbText()">⌨️ 发送文字</button>
+                        <button type="button" class="btn-action" style="padding: 6px 10px; font-size: 12px; white-space: nowrap;" onclick="sendAdbKey(66)" title="模拟器回车键">↩️ 回车</button>
+                        <button type="button" class="btn-action" style="padding: 6px 10px; font-size: 12px; white-space: nowrap;" onclick="sendAdbKey(4)" title="模拟器返回键">⬅️ 返回</button>
                     </div>
                 </div>
-                <div id="area-auto-rotation" style="display: none;">
-                    <div class="form-row">
-                        <span>无人机加速对象</span>
-                        <select id="cfgDronesTarget">
-                            <option value="Money">龙门币</option>
-                            <option value="BattleRecord">经验书</option>
-                            <option value="Orundum">合成玉</option>
-                            <option value="OriginiumShard">源石碎片</option>
-                            <option value="PureGold">赤金</option>
-                        </select>
-                    </div>
-                    <div class="form-row">
-                        <span>每日单次运行时间</span>
-                        <div style="display: flex; gap: 8px; align-items: center;">
-                            <input type="time" id="cfgDailySingleTime" class="form-input" style="width: 130px; text-align: center; font-size: 14px; font-weight: bold;" onchange="updateDailySingleTimeUI(this.value)" />
-                        </div>
-                    </div>
-                    <!-- 一天一登 59 分钟独占时段卡片 -->
-                    <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border); border-radius: 8px; padding: 12px; margin: 10px 0;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                            <span style="font-size: 12px; font-weight: 600; color: var(--claude-clay);">⏱ 每日单次独占时段</span>
-                            <span id="daily-conflict-status" class="badge" style="background: rgba(40,167,69,0.15); color: #28a745;">检查中...</span>
-                        </div>
-                        <div style="display: flex; flex-direction: column; gap: 6px; font-size: 12px;">
-                            <div style="display: flex; justify-content: space-between; align-items: center; background: var(--claude-surface); padding: 8px 10px; border-radius: 6px; border: 1px solid var(--claude-border-subtle);">
-                                <div>
-                                    <span style="color: var(--claude-text-muted);">计划执行时刻:</span>
-                                    <b id="daily-run-time-display" style="font-family: var(--font-mono); margin-left: 6px; color: var(--claude-text-main);">16:00</b>
-                                </div>
-                                <div>
-                                    <span style="color: var(--claude-text-muted);">59 分钟独占窗口:</span>
-                                    <span id="daily-exclusive-window-display" class="slot-pill" style="font-weight: bold; margin-left: 6px;">16:00 ~ 16:59</span>
-                                </div>
-                            </div>
-                            <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--claude-text-dim); padding: 0 4px;">
-                                <span>前序最晚登录: <b id="daily-prev-safe" style="color: var(--claude-text-muted);">15:00 止</b></span>
-                                <span>后续最早登录: <b id="daily-next-safe" style="color: var(--claude-text-muted);">17:00 起</b></span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 24小时全天时段分布甘特轴与冲突监控 -->
-                <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border); border-radius: var(--radius-md); padding: 14px; margin: 12px 0;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 8px;">
-                        <div style="display: flex; align-items: center; gap: 6px;">
-                            <span style="font-size: 13px; font-weight: 600; color: var(--claude-clay);">🕒 全天 24 小时排班时段分布</span>
-                            <span class="badge" style="font-size: 10px; background: rgba(217, 119, 69, 0.15); color: var(--claude-clay);">59 分钟独占保护</span>
-                        </div>
-                        <div style="font-size: 11px; color: var(--claude-text-muted);">
-                            <span style="display: inline-block; width: 8px; height: 8px; background: var(--claude-clay); border-radius: 2px; margin-right: 4px;"></span>当前账号
-                            <span style="display: inline-block; width: 8px; height: 8px; background: #64748b; border-radius: 2px; margin-left: 8px; margin-right: 4px;"></span>其他账号
-                        </div>
-                    </div>
-
-                    <!-- 24小时甘特条 -->
-                    <div id="timeline-bar-container" style="position: relative; height: 32px; background: var(--claude-surface); border: 1px solid var(--claude-border); border-radius: 6px; overflow: hidden; margin-bottom: 6px;">
-                        <div style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex;">
-                            <div style="flex: 1; border-right: 1px dashed var(--claude-border-subtle);"></div>
-                            <div style="flex: 1; border-right: 1px dashed var(--claude-border-subtle);"></div>
-                            <div style="flex: 1; border-right: 1px dashed var(--claude-border-subtle);"></div>
-                            <div style="flex: 1; border-right: 1px dashed var(--claude-border-subtle);"></div>
-                            <div style="flex: 1; border-right: 1px dashed var(--claude-border-subtle);"></div>
-                            <div style="flex: 1;"></div>
-                        </div>
-                        <div id="timeline-blocks" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></div>
-                    </div>
-                    <!-- 刻度标签 -->
-                    <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--claude-text-dim); margin-bottom: 10px; padding: 0 2px;">
-                        <span>00:00</span>
-                        <span>04:00</span>
-                        <span>08:00</span>
-                        <span>12:00</span>
-                        <span>16:00</span>
-                        <span>20:00</span>
-                        <span>24:00</span>
-                    </div>
-
-                    <div id="timeline-slot-details" style="display: flex; flex-direction: column; gap: 6px; font-size: 11px;"></div>
-                    
-                    <div style="margin-top: 10px; padding: 8px 10px; background: rgba(0,0,0,0.18); border-radius: 6px; font-size: 11px; color: var(--claude-text-muted); line-height: 1.5;">
-                        🔒 <b>单模拟器防冲突规则</b>：每个账号登录后独占 59 分钟。任意两次登录之间必须间隔至少 60 分钟例如 10:00 登录占用至 10:59，其他账号最晚 09:00 登录，最早 11:00 登录。。导入基建表或修改时间时系统将自动校验。
-                    </div>
-                </div>
-
-                <div class="form-row">
-                    <span>作战模式策略</span>
-                    <select id="cfgFightMode" onchange="toggleFightModeUI(this.value)">
-                        <option value="daily_depot_maintain">日常清智与芯片作战</option>
-                        <option value="manual_stage">主刷指定活动关卡</option>
-                    </select>
-                </div>
-                <div class="form-row" id="rowPrimaryStage">
-                    <span>主刷活动关卡名称</span>
-                    <input type="text" id="cfgManualStage" placeholder="例如 CW-10" style="width: 140px; text-align: center;" />
-                </div>
-                <div class="form-row">
-                    <span>明日方舟游戏账号</span>
-                    <div style="display: flex; gap: 8px; align-items: center;">
-                        <span id="cfgGameAccountDisplay" style="font-family: monospace; font-size: 13px; font-weight: 600; color: var(--claude-text-main); background: var(--claude-surface-inset); padding: 4px 10px; border-radius: var(--radius-md); border: 1px solid var(--claude-border);">******1234</span>
-                        <input type="text" id="cfgGameAccount" class="form-input" placeholder="输入游戏手机号/UID..." style="width: 140px; text-align: center; display: none;" />
-                        <button type="button" class="btn-action" style="padding: 3px 8px; font-size: 11px;" id="btnToggleAccEdit" onclick="toggleAccountEdit()">✏️ 修改</button>
-                    </div>
-                </div>
-                <div class="form-row">
-                    <span>明日方舟游戏登录密码</span>
-                    <div style="display: flex; gap: 6px; align-items: center;">
-                        <input type="password" id="cfgGamePassword" class="form-input" placeholder="输入登录密码..." style="width: 140px; text-align: center;" />
-                        <button type="button" class="btn-action" style="padding: 3px 8px; font-size: 11px;" onclick="togglePwdVisibility('cfgGamePassword')">👁 显隐</button>
-                    </div>
-                </div>
-
-                <button class="btn-primary" style="margin-top: 14px;" onclick="saveCurrentAccountConfig()">保存当前账号策略更改</button>
             </div>
 
-            <!-- 右栏: 包含公招策略卡片 与 理智药退出策略卡片 -->
-            <div style="display: flex; flex-direction: column; gap: 16px;">
-                <!-- 卡片 2: 公招策略与日常限额 -->
-                <div class="card">
-                    <div class="card-header">
-                        <span>公招策略与日常限额</span>
-                        <span id="recruit-today-badge" class="badge" style="background: rgba(40,167,69,0.15); color: #28a745;">今日已消耗: 0 / 4 张</span>
-                    </div>
-                    <div class="form-row">
-                        <span>每日公招上限 (张/天)</span>
-                        <div style="display: flex; gap: 8px; align-items: center;">
-                            <input type="number" id="cfgRecruitDailyLimit" min="1" max="12" class="form-input" style="width: 100px; text-align: center; font-weight: bold;" value="4" />
-                            <span style="font-size: 11px; color: var(--claude-text-muted);">张 (建议 1~8 张)</span>
+            <!-- 右栏: MAA 桌面版原生小框面板 (高度 100%，与左栏底端平齐) -->
+            <div class="dashboard-panel maa-desktop-panel">
+                <!-- MAA 顶部控制条与当前配置 -->
+                <div class="maa-top-bar">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span class="maa-logo-badge">MAA</span>
+                        <div style="display: flex; flex-direction: column;">
+                            <span style="font-size: 13px; font-weight: 700; color: var(--claude-text-main);">
+                                <span id="maaCurrentAccountTitle">当前账号</span> · 任务配置
+                            </span>
+                            <span id="maaTaskStatusBadge" style="font-size: 11px; color: var(--claude-text-muted);">检查中...</span>
                         </div>
                     </div>
-                    <div class="form-row">
-                        <span>公招六星高级资深策略</span>
-                        <select id="cfg6StarStrategy">
-                            <option value="notify_user">保留标签并推送通知 (等待人工确认)</option>
-                            <option value="unowned_first">优先锁定未获取干员 (全自动锁定)</option>
-                        </select>
-                    </div>
-                    <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border); border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: 11px; color: var(--claude-text-muted); line-height: 1.5;">
-                        💡 <b>公招策略机制</b>：<br>
-                        • <b>刷新优先</b>：每次运行优先无条件消耗 3 次刷新机会寻找高星干员，刷新不占用公招券额度。<br>
-                        • <b>严禁用加急券</b>：作为日常托管，本系统严格禁止使用加急许可，仅依靠自然时间轮转。<br>
-                        • <b>按日智能限额</b>：每日 04:00 自动重置计数。单次登录最多开启 min(4, 剩余配额) 个新槽位，达到上限后仅收干员不再扣券。
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="btn-action" style="padding: 3px 8px; font-size: 11px;" onclick="loadMaaConfigForCurrentAccount()" title="重载最新配置">⟳ 刷新</button>
+                        <button type="button" class="btn-primary" style="padding: 3px 10px; font-size: 11px;" onclick="saveMaaConfigForCurrentAccount()" id="btnSaveMaaConfig">💾 保存长草配置</button>
                     </div>
                 </div>
 
-                <!-- 卡片 3: 理智药、周常与退出行为 -->
-                <div class="card">
-                    <div class="card-header">
-                        <span>理智药、周常与退出行为</span>
-                    </div>
-                    <div class="form-row">
-                        <span>临期理智药消耗策略</span>
-                        <select id="cfgExpiringMed">
-                            <option value="true">临期 2 天内自动使用</option>
-                            <option value="false">不使用</option>
-                        </select>
-                    </div>
+                <!-- MAA 4 个子选项卡 -->
+                <div class="maa-subnav">
+                    <button type="button" class="maa-subnav-btn active" onclick="switchMaaSubTab('maa-tab-queue')" id="subtab-btn-queue">🌾 一键长草</button>
+                    <button type="button" class="maa-subnav-btn" onclick="switchMaaSubTab('maa-tab-copilot')" id="subtab-btn-copilot">⚔️ 自动战斗</button>
+                    <button type="button" class="maa-subnav-btn" onclick="switchMaaSubTab('maa-tab-timers')" id="subtab-btn-timers">⏱️ 定时执行</button>
+                    <button type="button" class="maa-subnav-btn" onclick="switchMaaSubTab('maa-tab-logs')" id="subtab-btn-logs">📜 运行日志</button>
+                </div>
 
-                    <div class="form-row">
-                        <span>每周一自动清空剿灭</span>
-                        <select id="cfgAnnihilationMed">
-                            <option value="true">允许吃药补足</option>
-                            <option value="false">仅自然理智</option>
-                        </select>
+                <!-- 子页面 1: 一键长草任务队列 -->
+                <div id="maa-tab-queue" class="maa-subcontent active">
+                    <div class="maa-action-bar">
+                        <button type="button" class="dash-btn-run" id="btnRunDaily" onclick="triggerMaaQueueRun()">▶ 启动长草队列</button>
+                        <button type="button" class="btn-action" style="font-size: 11px; padding: 6px 10px; font-weight: 600;" onclick="openAddMaaTaskModal()">➕ 添加任务</button>
+                        <button type="button" class="dash-btn-stop" id="btnStopTask" onclick="triggerTaskStop()">⏸ 强制停止</button>
+                        <button type="button" class="btn-action" id="btnStartEmu" onclick="triggerStartEmu()" style="color: var(--claude-sage); border-color: var(--claude-sage); font-weight: 600;">▶ 开启模拟器</button>
+                        <button type="button" class="dash-btn-close-emu" onclick="triggerCloseEmu()">⏹ 停止模拟器</button>
                     </div>
-                    <div class="form-row">
-                        <span>任务完成退出动作</span>
-                        <select id="cfgOnComplete">
-                            <option value="stop_emu">退出游戏并休眠模拟器</option>
-                            <option value="close_game">仅退出游戏客户端</option>
-                            <option value="keep_running">保持运行</option>
-                        </select>
+                    <div id="maa-queue-list" class="maa-task-list">
+                        <!-- 9 项任务卡片动态渲染 -->
                     </div>
+                </div>
 
-                    <!-- 账号独立通信渠道设置 -->
-                    <div style="border-top: 1px solid var(--claude-border-subtle); padding-top: 12px; margin-top: 12px;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <span style="font-size: 13px; font-weight: 600; color: var(--claude-clay);">🔔 独立通信渠道设置</span>
-                            <button class="btn-action" style="padding: 2px 10px; font-size: 11px;" onclick="testNotifyConfig()">📨 测试当前通知</button>
+                <!-- 子页面 2: Copilot 自动战斗小工具 (1:1 复刻 MAA 桌面版 自动战斗) -->
+                <div id="maa-tab-copilot" class="maa-subcontent" style="display: none;">
+                    <!-- 作业导入区 -->
+                    <div class="card" style="margin-bottom: 10px; padding: 12px;">
+                        <div style="font-size: 13px; font-weight: 600; color: var(--claude-clay); margin-bottom: 8px;">🎯 导入自动战斗作业</div>
+                        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                            <button type="button" class="btn-action" style="flex:1; padding: 8px; font-size: 12px;" onclick="triggerCopilotUpload()">📤 添加本地 JSON 作业</button>
+                            <input type="file" id="fileUploadCopilot" accept=".json" multiple style="display: none;" onchange="handleCopilotUpload(event)" />
                         </div>
-                        <div style="font-size: 11px; color: var(--claude-text-muted); margin-bottom: 8px;">
-                            支持 WxPusher 微信消息与 SMTP 邮箱授权码，每个账号配置独立隔离
+                        <div style="display: flex; gap: 6px; align-items: center;">
+                            <input type="text" id="copilotMysteryCode" class="form-input" placeholder="输入作业站神秘代码 (纯数字 ID)" style="flex:1; margin-bottom:0; font-size:12px;" onkeydown="if(event.key==='Enter') fetchCopilotByCode();" />
+                            <button type="button" class="btn-action" style="padding: 7px 12px; font-size: 12px; white-space: nowrap; color: var(--claude-clay); border-color: var(--claude-clay);" onclick="fetchCopilotByCode(this)">☁️ 拉取</button>
+                        </div>
+                        <div id="copilotJobListBox" style="margin-top: 10px; display: none;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                                <span style="font-size: 11px; font-weight: 600; color: var(--claude-text-main);">已导入作业列表</span>
+                                <button type="button" class="btn-action" style="font-size: 10px; padding: 2px 6px; color: var(--claude-danger);" onclick="clearCopilotJobs()">🧹 清空</button>
+                            </div>
+                            <div id="copilotJobList" style="display: flex; flex-direction: column; gap: 5px;"></div>
+                        </div>
+                        <div id="copilotJobDetails" style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border-subtle); border-radius: 6px; padding: 8px 10px; margin-top: 8px; font-size: 11px; color: var(--claude-text-muted); display: none;">
+                            <div id="copilotJobTitle" style="font-weight: bold; color: var(--claude-text-main); margin-bottom: 2px;"></div>
+                            <div id="copilotJobDesc"></div>
+                        </div>
+                    </div>
+
+                    <!-- 编队与作战参数 -->
+                    <div class="card" style="padding: 12px; margin-bottom: 10px;">
+                        <!-- 两个初始开关 -->
+                        <div class="form-row">
+                            <div style="display:flex;flex-direction:column;">
+                                <span style="font-size: 12px; font-weight: 600;">自动编队</span>
+                                <span style="font-size:10px;color:var(--claude-text-dim);">清空当前编队并按作业自动编排干员</span>
+                            </div>
+                            <input type="checkbox" id="copilotForm" onchange="onCopilotFormChange(this.checked)" />
                         </div>
                         <div class="form-row">
-                            <span>通知方式</span>
-                            <select id="cfgNotifyChannel" onchange="toggleNotifyUI(this.value)">
-                                <option value="none">关闭通知 (不推送)</option>
-                                <option value="wxpusher">仅使用 WxPusher 微信推送</option>
-                                <option value="email">仅使用 SMTP 邮箱推送</option>
-                                <option value="both">同时使用 WxPusher 与 邮箱推送</option>
-                            </select>
-                        </div>
-
-                        <div id="notify-wx-box" style="margin-top: 8px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid var(--claude-border-subtle); display: none;">
-                            <div style="font-size: 12px; font-weight: 600; color: var(--claude-text-main); margin-bottom: 4px;">WxPusher 配置</div>
-                            <label style="font-size: 11px; color: var(--claude-text-dim);">应用 AppToken (支持 SPT_ 极简Token 或 AT_ 标准Token)</label>
-                            <input type="text" id="cfgWxToken" class="form-input" placeholder="留空使用默认，或填 SPT_xxxx / AT_xxxx" />
-                            <label style="font-size: 11px; color: var(--claude-text-dim);">目标接收 UID (仅 AT_ 时需要，逗号隔开；SPT_留空)</label>
-                            <input type="text" id="cfgWxUids" class="form-input" placeholder="例如: UID_a1b2c3d4e5" />
-                        </div>
-
-                        <div id="notify-email-box" style="margin-top: 8px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid var(--claude-border-subtle); display: none;">
-                            <div style="font-size: 12px; font-weight: 600; color: var(--claude-text-main); margin-bottom: 4px;">SMTP 邮箱配置 (授权码模式)</div>
-                            <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 6px;">
-                                <div>
-                                    <label style="font-size: 11px; color: var(--claude-text-dim);">SMTP 服务器地址</label>
-                                    <input type="text" id="cfgEmailHost" class="form-input" placeholder="例如: smtp.qq.com" />
-                                </div>
-                                <div>
-                                    <label style="font-size: 11px; color: var(--claude-text-dim);">端口</label>
-                                    <input type="number" id="cfgEmailPort" class="form-input" value="465" />
-                                </div>
+                            <div style="display:flex;flex-direction:column;">
+                                <span style="font-size: 12px; font-weight: 600;">多作业模式</span>
+                                <span style="font-size:10px;color:var(--claude-text-dim);">连续执行列表中的多个作业 (同一关卡区域)</span>
                             </div>
-                            <label style="font-size: 11px; color: var(--claude-text-dim);">发件邮箱账号</label>
-                            <input type="text" id="cfgEmailSender" class="form-input" placeholder="例如: your_qq@qq.com" />
-                            <label style="font-size: 11px; color: var(--claude-text-dim);">发件邮箱授权码 (16位独立服务授权码)</label>
-                            <input type="password" id="cfgEmailAuth" class="form-input" placeholder="邮箱服务商生成的授权码" />
-                            <label style="font-size: 11px; color: var(--claude-text-dim);">收件人邮箱</label>
-                            <input type="text" id="cfgEmailReceiver" class="form-input" placeholder="接收通知的邮箱地址" />
+                            <input type="checkbox" id="copilotUseList" onchange="onCopilotUseListChange(this.checked)" />
                         </div>
+
+                        <!-- 自动编队依赖项 (Form=true 时显示) -->
+                        <div id="copilotFormDeps" style="display: none; border-top: 1px dashed var(--claude-border-subtle); padding-top: 8px; margin-top: 6px;">
+                            <div class="form-row">
+                                <span style="font-size: 12px;">使用指定编队栏位</span>
+                                <input type="checkbox" id="copilotUseFormation" onchange="toggleCopilotUseFormation(this.checked)" />
+                            </div>
+                            <div class="form-row" id="rowCopilotFormationIndex" style="display: none;">
+                                <span style="font-size: 12px;">编队栏位 (1-4)</span>
+                                <select id="copilotFormationIndex">
+                                    <option value="1">第一编队</option>
+                                    <option value="2">第二编队</option>
+                                    <option value="3">第三编队</option>
+                                    <option value="4">第四编队</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <span style="font-size: 12px;">忽视干员练度要求</span>
+                                <input type="checkbox" id="copilotIgnoreReq" />
+                            </div>
+                            <div class="form-row">
+                                <span style="font-size: 12px;">使用助战干员</span>
+                                <input type="checkbox" id="copilotUseSupport" onchange="toggleCopilotSupport(this.checked)" />
+                            </div>
+                            <div class="form-row" id="rowCopilotSupport" style="display: none;">
+                                <span style="font-size: 12px;">助战模式</span>
+                                <select id="copilotSupport">
+                                    <option value="1">仅补充必要 (WhenNeeded)</option>
+                                    <option value="3">随机加一个, 刷信用点用 (Random)</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <span style="font-size: 12px;">追加信赖干员 (信赖升序填充空位)</span>
+                                <input type="checkbox" id="copilotAddTrust" />
+                            </div>
+                            <div class="form-row">
+                                <span style="font-size: 12px;">追加自定干员</span>
+                                <input type="checkbox" id="copilotAddUserAdditional" onchange="toggleCopilotUserAdditional(this.checked)" />
+                            </div>
+                            <div id="copilotUserAdditionalBox" style="display: none; border-top: 1px dashed var(--claude-border-subtle); padding-top: 8px; margin-top: 4px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <span style="font-size: 11px; font-weight: 600; color: var(--claude-text-main);">自定干员列表</span>
+                                    <button type="button" class="btn-action" style="font-size: 10px; padding: 2px 6px;" onclick="addCopilotOperatorRow()">+ 添加干员</button>
+                                </div>
+                                <div id="copilotUserAdditionalList" style="display: flex; flex-direction: column; gap: 4px;"></div>
+                            </div>
+                        </div>
+
+                        <!-- 多作业模式依赖项 (UseCopilotList=true 时显示) -->
+                        <div id="copilotListDeps" style="display: none; border-top: 1px dashed var(--claude-border-subtle); padding-top: 8px; margin-top: 6px;">
+                            <div class="form-row">
+                                <span style="font-size: 12px;">理智不足时允许吃理智药</span>
+                                <input type="checkbox" id="copilotSanityPotion" />
+                            </div>
+                            <div style="font-size:10px;color:var(--claude-text-dim);line-height:1.5;">多作业模式下从「关卡所在的地图界面」开始，自动连续执行列表中已勾选的作业。</div>
+                        </div>
+
+                        <!-- 单作业循环 (UseCopilotList=false 时显示) -->
+                        <div id="copilotLoopDeps">
+                            <div class="form-row">
+                                <span style="font-size: 12px;">循环战斗次数</span>
+                                <input type="number" id="copilotLoopTimes" class="form-input" value="1" min="1" max="99" style="width: 80px; text-align: center;" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="maa-action-bar">
+                        <button type="button" class="dash-btn-run" onclick="triggerMaaCopilotRun()">▶ 启动 Copilot 自动战斗</button>
+                        <button type="button" class="dash-btn-stop" onclick="triggerTaskStop()">⏸ 强制停止</button>
+                    </div>
+                </div>
+
+                <!-- 子页面 3: 定时执行与 40 分钟独占时段 -->
+                <div id="maa-tab-timers" class="maa-subcontent" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <div>
+                            <span style="font-size: 13px; font-weight: 600; color: var(--claude-clay);">⏱ 每日自动定时执行</span>
+                            <span class="badge" style="font-size: 10px; margin-left: 6px; background: rgba(217, 119, 69, 0.15); color: var(--claude-clay);">40 分钟独占保护</span>
+                        </div>
+                        <button type="button" class="btn-action" style="padding: 3px 8px; font-size: 11px;" onclick="addNewMaaTimerRow()">+ 添加班次</button>
+                    </div>
+
+                    <div style="font-size: 11px; color: var(--claude-text-dim); margin-bottom: 8px; line-height: 1.4;">
+                        说明：系统到达设定时间将自动唤醒模拟器并执行该账号的长草任务。每个账号独占 40 分钟，重叠冲突将无法保存。
+                    </div>
+                    <div class="form-row" style="background: var(--claude-surface-inset); padding: 6px 10px; border-radius: 6px; margin-bottom: 10px;">
+                        <span style="font-size: 12px; font-weight: 600;">强制按排班计划唤醒执行 (ForceScheduledStart)</span>
+                        <input type="checkbox" id="maaTimerForceStart" checked onchange="if(CURRENT_MAA_TIMERS) CURRENT_MAA_TIMERS.ForceScheduledStart = this.checked;" />
+                    </div>
+
+                    <!-- 冲突警示横幅 (动态显隐) -->
+                    <div id="maaTimerConflictAlert" class="tip-msg" style="display: none; background: rgba(201, 74, 68, 0.15); border: 1px solid var(--claude-danger); color: #ff8077; padding: 8px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px;"></div>
+
+                    <div id="maaTimersList" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+                        <!-- 动态渲染定时班次 -->
+                    </div>
+
+                    <!-- 24小时全服排班时段可视化条 -->
+                    <div style="background: var(--claude-surface-inset); border: 1px solid var(--claude-border); border-radius: 8px; padding: 10px; margin-bottom: 12px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px;">
+                            <span style="font-weight: 600; color: var(--claude-text-main);">全服 24 小时排班时段分布</span>
+                            <span style="color: var(--claude-text-dim);"><span style="display:inline-block;width:8px;height:8px;background:var(--claude-clay);border-radius:2px;margin-right:3px;"></span>当前账号 <span style="display:inline-block;width:8px;height:8px;background:#64748b;border-radius:2px;margin-left:6px;margin-right:3px;"></span>其他账号</span>
+                        </div>
+                        <div id="maa-timeline-bar" style="position: relative; height: 26px; background: var(--claude-surface); border: 1px solid var(--claude-border-subtle); border-radius: 4px; overflow: hidden; margin-bottom: 4px;">
+                            <div style="position: absolute; top:0; left:0; width:100%; height:100%; display: flex;">
+                                <div style="flex:1; border-right: 1px dashed var(--claude-border-subtle);"></div>
+                                <div style="flex:1; border-right: 1px dashed var(--claude-border-subtle);"></div>
+                                <div style="flex:1; border-right: 1px dashed var(--claude-border-subtle);"></div>
+                                <div style="flex:1; border-right: 1px dashed var(--claude-border-subtle);"></div>
+                                <div style="flex:1; border-right: 1px dashed var(--claude-border-subtle);"></div>
+                                <div style="flex:1;"></div>
+                            </div>
+                            <div id="maa-timeline-blocks" style="position: absolute; top:0; left:0; width:100%; height:100%;"></div>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; font-size: 9px; color: var(--claude-text-dim);">
+                            <span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>24:00</span>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 8px;">
+                        <button type="button" class="btn-primary" style="flex: 1;" onclick="saveMaaTimersForCurrentAccount()">💾 保存定时执行设置</button>
+                    </div>
+                </div>
+
+                <!-- 子页面 4: 运行日志 -->
+                <div id="maa-tab-logs" class="maa-subcontent" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; margin-top: 4px;">
+                        <div class="log-mode-switch" id="logModeSwitch">
+                            <button type="button" class="log-mode-btn active" id="btnLogHuman" onclick="setLogViewMode('human')">✨ 人类可读</button>
+                            <button type="button" class="log-mode-btn" id="btnLogRaw" onclick="setLogViewMode('raw')">🖥️ 原始终端</button>
+                        </div>
+                        <button type="button" class="btn-action" style="padding: 2px 8px; font-size: 11px;" onclick="loadTodayLogs()">⟳ 刷新日志</button>
+                    </div>
+                    <div style="margin-top: 14px;">
+                        <div class="log-terminal" id="logTerminal" style="height: 420px; overflow-y: auto;">正在读取今日运行日志...</div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-
     <!-- TAB 3: 托管账号管理 -->
     <div id="account-tab" class="tab-content">
         <div class="card">
@@ -2009,7 +2749,7 @@ APP_PAGE = """<!DOCTYPE html>
                         <strong id="stat-total-accs" style="color: var(--claude-sage); font-size: 15px;">--</strong>
                     </div>
                     <div style="display: flex; justify-content: space-between; padding: 8px 12px; background: var(--claude-surface-inset); border-radius: 8px;">
-                        <span>24 小时已占用 59 分钟时段</span>
+                        <span>24 小时已占用 40 分钟时段</span>
                         <strong id="stat-total-slots" style="color: var(--claude-text-main); font-size: 15px;">--</strong>
                     </div>
                 </div>
@@ -2050,7 +2790,10 @@ APP_PAGE = """<!DOCTYPE html>
             if (aBtn) aBtn.innerText = label;
         }
         initTheme();
-
+        setTimeout(() => {
+            initScreenInteraction();
+            loadMaaConfigForCurrentAccount();
+        }, 300);
 
         let GLOBAL_ACCOUNTS_DATA = { accounts: [], active_account_id: "" };
         
@@ -2139,10 +2882,11 @@ APP_PAGE = """<!DOCTYPE html>
             });
 
             // 3. 启动投屏、日志与任务状态轮询
-            refreshScreen(true);
             loadTaskStatus();
-            
+            startTaskStatusPolling();
             loadTodayLogs();
+            // 默认 30FPS 直通模式 (若不支持 WebCodecs 会自动降级为 5 秒刷新)
+            setScreenMode('30fps');
         }
         window.addEventListener('DOMContentLoaded', initData);
 
@@ -2209,8 +2953,9 @@ APP_PAGE = """<!DOCTYPE html>
             allSlots.forEach(slot => {
                 const isCur = (slot.account_id === curAccId);
                 const startMin = slot.start_minutes;
+                const winMin = slot.window_minutes || 40;
                 const leftPct = (startMin / 1440 * 100).toFixed(2);
-                const widthPct = (59 / 1440 * 100).toFixed(2);
+                const widthPct = (winMin / 1440 * 100).toFixed(2);
 
                 const blk = document.createElement("div");
                 blk.style.position = "absolute";
@@ -2223,7 +2968,7 @@ APP_PAGE = """<!DOCTYPE html>
                 blk.style.background = isCur ? "var(--claude-clay)" : "#64748b";
                 blk.style.boxShadow = isCur ? "0 0 6px rgba(217, 119, 69, 0.6)" : "none";
                 blk.style.cursor = "pointer";
-                blk.title = `【${slot.account_name}】${slot.range_str} (独占59分钟)`;
+                blk.title = `【${slot.account_name}】${slot.range_str} (独占${winMin}分钟)`;
                 container.appendChild(blk);
 
                 const tagColor = isCur ? "color: var(--claude-clay); font-weight: 600;" : "color: var(--claude-text-main);";
@@ -2231,11 +2976,11 @@ APP_PAGE = """<!DOCTYPE html>
                     <div style="display: flex; justify-content: space-between; align-items: center; background: var(--claude-surface); padding: 5px 10px; border-radius: 6px; border: 1px solid var(--claude-border-subtle);">
                         <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
                             <span class="slot-pill" style="${isCur ? "" : "background: rgba(100,116,139,0.15); color: #94a3b8; border-color: rgba(100,116,139,0.3);"}">⏱ ${slot.range_str}</span>
-                            <span class="badge" style="font-size: 10px;">${slot.mode_label || (slot.mode === 'daily_once' ? '一天一登' : '排班表')}</span>
+                            <span class="badge" style="font-size: 10px;">${slot.mode_label || 'MAA定时'}</span>
                             <span style="font-size: 11px; ${tagColor}">${escapeHtml(slot.account_name)}</span>
                             ${isCur ? '<span class="badge" style="background: rgba(217,119,69,0.15); color: var(--claude-clay); padding: 1px 5px; font-size: 10px;">当前账号</span>' : ""}
                         </div>
-                        <span style="font-size: 10px; color: var(--claude-text-dim);">独占 59 分钟，前后间隔需大于 60 分钟</span>
+                        <span style="font-size: 10px; color: var(--claude-text-dim);">独占 ${winMin} 分钟，单模拟器重叠冲突禁止保存</span>
                     </div>
                 `;
             });
@@ -2278,10 +3023,18 @@ APP_PAGE = """<!DOCTYPE html>
                 });
                 safeSetText("stat-total-users", (data.users || []).length + " 人");
                 safeSetText("stat-total-accs", totalAccs + " 个");
-                safeSetText("stat-total-slots", totalSlots + " 个时段");
+                safeSetText("stat-total-slots", totalSlots + " 个时段 (40分独占)");
 
                 renderAdminUsersTable(data.users || []);
             }).catch(e => console.warn("loadAdminOverview error:", e));
+        }
+
+        function adminEditAccountTimers(accId, accName) {
+            switchTab('screen-tab');
+            changeActiveAccount(accId);
+            setTimeout(() => {
+                switchMaaSubTab('maa-tab-timers');
+            }, 100);
         }
 
         function renderAdminUsersTable(users) {
@@ -2300,7 +3053,7 @@ APP_PAGE = """<!DOCTYPE html>
                             <th>用户身份</th>
                             <th>注册时间</th>
                             <th>托管方舟账号</th>
-                            <th>全天独占时段</th>
+                            <th>全天独占时段 (40分钟)</th>
                             <th>操作</th>
                         </tr>
                     </thead>
@@ -2321,22 +3074,22 @@ APP_PAGE = """<!DOCTYPE html>
                     slotsHtml = "<span style='color: var(--claude-text-dim);'>未占用</span>";
                 } else {
                     accsHtml = u.accounts.map(a => `
-                        <div style="margin-bottom: 6px;">
-                            <b>${escapeHtml(a.name)}</b> 
-                            <span style="font-family: monospace; color: var(--claude-text-dim);">(${a.account_name_masked})</span>
-                            <span style="font-size: 11px; color: ${a.has_password ? "var(--claude-sage)" : "var(--claude-text-dim)"};">
-                                ${a.has_password ? " · 已存密" : " · 无密码"}
-                            </span>
-                            <div style="font-size: 10px; color: var(--claude-text-muted);">
-                                模式: ${a.infrast_mode === "daily_once" ? "一天一登 (" + a.daily_single_time + ")" : "排班表 " + (a.plan_file || "默认") + ")"}
+                        <div style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; background: var(--claude-surface-inset); padding: 6px 10px; border-radius: 6px;">
+                            <div>
+                                <b>${escapeHtml(a.name)}</b> 
+                                <span style="font-family: monospace; color: var(--claude-text-dim);">(${a.account_name_masked})</span>
+                                <div style="font-size: 10px; color: var(--claude-text-muted); margin-top: 2px;">
+                                    ⏱ 启用班次: <b>${a.timers_count || (a.occupied_slots||[]).length}</b> 个 (${a.window_minutes || 40}分钟独占)
+                                </div>
                             </div>
+                            <button type="button" class="btn-action" style="font-size: 11px; padding: 3px 8px; font-weight: 600; color: var(--claude-clay); border-color: var(--claude-clay);" onclick="adminEditAccountTimers('${a.id}', '${escapeHtml(a.name)}')">⏱️ 代管定时</button>
                         </div>
                     `).join("");
 
                     slotsHtml = u.accounts.map(a => {
                         if (!a.occupied_slots || a.occupied_slots.length === 0) return "<span style='color: var(--claude-text-dim);'>无生效时段</span>";
                         return `<div style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px;">
-                            ${a.occupied_slots.map(s => `<span class="slot-pill">⏱ ${s}</span>`).join("")}
+                            ${a.occupied_slots.map(s => `<span class="slot-pill" style="font-size: 11px;">⏱ ${s} (${a.window_minutes || 40}分)</span>`).join("")}
                         </div>`;
                     }).join("");
                 }
@@ -2422,6 +3175,7 @@ APP_PAGE = """<!DOCTYPE html>
                 renderHeaderAccounts();
                 renderAccountsList();
                 renderCurrentAccountDetails();
+                loadMaaConfigForCurrentAccount();
                 const curAcc = getCurrentAccount();
                 if (curAcc && curAcc.id) {
                     renderAccountDataTab(curAcc);
@@ -2450,6 +3204,7 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         function changeActiveAccount(accId) {
+            lockTouch();
             fetch('/api/accounts/switch', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -2459,6 +3214,8 @@ APP_PAGE = """<!DOCTYPE html>
                 renderHeaderAccounts();
                 renderAccountsList();
                 renderCurrentAccountDetails();
+                loadMaaConfigForCurrentAccount(accId);
+                loadMaaTimersForCurrentAccount();
                 const curAcc = getCurrentAccount();
                 if (curAcc && curAcc.id) {
                     renderAccountDataTab(curAcc);
@@ -2508,7 +3265,6 @@ APP_PAGE = """<!DOCTYPE html>
                     const btn = document.getElementById('btnToggleAccEdit');
                     if (btn) btn.innerText = '✏️ 修改';
                 }
-                safeSetVal('cfgGamePassword', acc.game_password || '');
                 toggleFightModeUI(fight.mode || 'daily_depot_maintain');
                 safeSetVal('cfgExpiringMed', fight.use_expiring_medicine ? 'true' : 'false');
                 safeSetVal('cfgAnnihilationMed', fight.annihilation_use_medicine ? 'true' : 'false');
@@ -2665,9 +3421,17 @@ APP_PAGE = """<!DOCTYPE html>
                             <button class="btn-action" style="padding: 2px 8px; font-size: 11px;" onclick="openRenameModal('${acc.id}', '${acc.name}')">✎ 改名</button>
                         </div>
                         <div style="font-size: 12px; color: var(--claude-text-muted);">
-                            游戏账号: <span style="font-family: monospace; color: var(--claude-text-main);">${acc.account_name || '未填'}</span> · 
-                            密码状态: <span style="color: ${acc.game_password ? 'var(--claude-sage)' : 'var(--claude-text-dim)'};">${acc.game_password ? '已保存密码' : '未存密码'}</span> · 
+                            账号标识: <span style="font-family: monospace; color: var(--claude-text-main);">${acc.account_name || '未填'}</span> · 
                             托管模式: ${modeDisplay}
+                        </div>
+                        <div style="font-size: 12px; color: var(--claude-text-muted); margin-top: 6px; display: flex; align-items: center; gap: 6px;">
+                            <span>🎬 完成后动作:</span>
+                            <select style="font-size:12px;padding:3px 6px;margin-bottom:0;" onchange="updateAccountOnComplete('${acc.id}', this.value)">
+                                <option value="auto" ${(acc.on_complete||'auto')==='auto'?'selected':''}>智能 (1小时内无班次则关模拟器，否则仅关游戏)</option>
+                                <option value="close_game" ${acc.on_complete==='close_game'?'selected':''}>仅退出明日方舟 (保留模拟器)</option>
+                                <option value="stop_emu" ${acc.on_complete==='stop_emu'?'selected':''}>退出模拟器 Docker (彻底释放资源)</option>
+                                <option value="keep_running" ${acc.on_complete==='keep_running'?'selected':''}>保持运行 (不退出)</option>
+                            </select>
                         </div>
                     </div>
                     <div style="display: flex; gap: 8px; align-items: center;">
@@ -2677,6 +3441,24 @@ APP_PAGE = """<!DOCTYPE html>
                 `;
                 box.appendChild(div);
             });
+        }
+
+        function updateAccountOnComplete(accId, val) {
+            const acc = (GLOBAL_ACCOUNTS_DATA.accounts || []).find(a => a.id === accId);
+            if (!acc) return;
+            acc.on_complete = val;
+            fetch('/api/accounts/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({account: acc})
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    const names = {auto:'智能退出', close_game:'仅退出游戏', stop_emu:'退出模拟器', keep_running:'保持运行'};
+                    console.log('退出策略已更新:', accId, names[val] || val);
+                } else {
+                    alert('保存失败: ' + (res.error || ''));
+                }
+            }).catch(e => alert('请求异常: ' + e));
         }
 
         function autoSuggestName(val) {
@@ -2896,7 +3678,6 @@ APP_PAGE = """<!DOCTYPE html>
             acc.fight.mode = getElVal('cfgFightMode', 'daily_depot_maintain');
             acc.fight.manual_stage = getElVal('cfgManualStage', 'CW-10').trim() || 'CW-10';
             acc.account_name = getElVal('cfgGameAccount', acc.account_name || '').trim();
-            acc.game_password = getElVal('cfgGamePassword', '').trim();
             acc.fight.use_expiring_medicine = (getElVal('cfgExpiringMed', 'true') === 'true');
             acc.fight.annihilation_use_medicine = (getElVal('cfgAnnihilationMed', 'true') === 'true');
 
@@ -3084,41 +3865,33 @@ APP_PAGE = """<!DOCTYPE html>
         function submitNewAccount() {
             const name = document.getElementById('newAccName').value.trim();
             const account_name = document.getElementById('newAccAccount').value.trim();
-            const plan_file = document.getElementById('newAccInfrast').value;
             const platform = document.getElementById('newAccPlatform').value;
-            const game_pwd = document.getElementById('newAccGamePwd').value.trim();
 
             if (!name || !account_name) {
-                alert('请填写完整账号备注名和游戏账号！');
+                alert('请填写完整账号备注名和账号标识（尾号/登录名）！');
                 return;
             }
-
-            const infMode = document.getElementById('newAccInfrastMode') ? document.getElementById('newAccInfrastMode').value : 'custom_plan';
-            const dailyTime = document.getElementById('newAccDailyTime') ? document.getElementById('newAccDailyTime').value : '16:00';
-            const effectiveSchedules = (infMode === 'daily_once') ? [dailyTime] : ['10:00', '16:00', '22:00'];
 
             const newAcc = {
                 id: 'acc_' + Date.now(),
                 name: name,
                 account_name: account_name,
-                game_password: game_pwd,
                 platform: platform || "Official",
                 enabled: true,
                 owner_username: (typeof CURRENT_USER !== 'undefined' && CURRENT_USER.username) ? CURRENT_USER.username : 'admin',
-                schedules: effectiveSchedules,
+                schedules: ['10:00', '16:00', '22:00'],
                 infrast: { 
-                    mode: infMode, 
-                    plan_file: plan_file || "default_plan.json", 
-                    drones: "Money", 
+                    mode: "custom_plan", 
+                    plan_file: "default_plan.json", 
+                    drones: "PureGold", 
                     threshold: 50, 
-                    dorm_not_stationed_enabled: false, 
-                    daily_single_time: dailyTime 
+                    dorm_not_stationed_enabled: true
                 },
-                fight: { mode: "daily_depot_maintain", manual_stage: "CW-10", fallback_stage: "1-7", series: 0, use_expiring_medicine: true, medicine_expire_days: 2, use_medicine: false, use_stone: false, annihilation_monday: true, annihilation_use_medicine: true },
-                recruit: { enabled: true, times: 3, select_6star_strategy: "unowned_first", refresh_level3: true },
+                fight: { mode: "daily_depot_maintain", manual_stage: "1-7", fallback_stage: "1-7", series: 0, use_expiring_medicine: true, medicine_expire_days: 2, use_medicine: false, use_stone: false, annihilation_monday: true, annihilation_use_medicine: true },
+                recruit: { enabled: true, times: 3, select_6star_strategy: "notify_user", refresh_level3: true },
                 mall: { enabled: true, buy_first: ["赤金", "招聘许可", "龙门币"], blacklist: ["碳", "家具", "加急许可"], reserve_max_credit: true },
                 award: { enabled: true, mail: true, free_gacha: true, orundum: true, mining: true, special_access: true },
-                on_complete: "stop_emu",
+                on_complete: "auto",
                 inventory: { "合成玉": 0, "至纯源石": 0, "龙门币": 0, "固源岩": 0, "源石碎片": 0, "last_updated": "未初始化" }
             };
 
@@ -3128,7 +3901,7 @@ APP_PAGE = """<!DOCTYPE html>
                 body: JSON.stringify({account: newAcc})
             }).then(r => r.json()).then(res => {
                 if (res.success) {
-                    alert(`新托管账号 ${name} 创建成功！`);
+                    alert(`新托管账号 ${name} 创建成功！\n请到左侧投屏解锁后，触屏手动登录该账号一次。`);
                     closeNewAccountModal();
                     loadAccountsData().then(() => {
                         load24HTimeline();
@@ -3141,14 +3914,64 @@ APP_PAGE = """<!DOCTYPE html>
         }
 
         // 看板操作与图文卡片流
+        let TASK_RUN_START_TS = null;
         function loadTaskStatus() {
             fetch('/api/task/status').then(r => r.json()).then(st => {
                 const badge = document.getElementById('task-status-badge');
+                const gbadge = document.getElementById('globalTaskBadge');
                 const btnDaily = document.getElementById('btnRunDaily');
                 const btnStop = document.getElementById('btnStopTask');
                 const stageBtns = document.querySelectorAll('.stage-run-btn');
 
-                if (st.running) {
+                const accLabel = (st && st.account_name) ? st.account_name : '';
+                const ownerLabel = (st && st.owner_username) ? st.owner_username : '';
+                const TASK_CN = {
+                    'StartUp': '开始唤醒', 'Recruit': '自动公招', 'Infrast': '基建换班',
+                    'Fight': '理智作战', 'Mall': '信用收支', 'Award': '领取奖励',
+                    'Depot': '仓库识别', 'OperBox': '干员识别', 'Copilot': '自动战斗',
+                    'CloseDown': '关闭游戏'
+                };
+                const curTask = (st && st.current_task) ? (TASK_CN[st.current_task] || st.current_task) : '';
+
+                if (gbadge) {
+                    const txt = gbadge.querySelector('.gtb-text');
+                    const elapsedEl = document.getElementById('gtbElapsed');
+                    const stopBtnEl = document.getElementById('gtbStopBtn');
+                    if (st && st.running) {
+                        gbadge.classList.remove('state-idle');
+                        gbadge.classList.add('state-running');
+                        let label = '⚡ 托管中';
+                        if (accLabel) label += `: ${accLabel}`;
+                        if (curTask) label += ` · ${curTask}`;
+                        if (txt) txt.innerText = label;
+                        gbadge.title = `正在执行托管任务` + (accLabel ? ` · 账号: ${accLabel}` : '') + (curTask ? ` · 当前: ${curTask}` : '') + (ownerLabel ? ` · 归属: ${ownerLabel}` : '');
+                        // 以服务端 started_at 为准显示已运行时长 (刷新/重连后不归零)
+                        if (st.started_at) {
+                            TASK_RUN_START_TS = st.started_at * 1000;
+                        } else if (TASK_RUN_START_TS === null) {
+                            TASK_RUN_START_TS = Date.now();
+                        }
+                        if (elapsedEl) {
+                            const secs = Math.max(0, Math.floor((Date.now() - TASK_RUN_START_TS) / 1000));
+                            const hh = String(Math.floor(secs/3600)).padStart(2,'0');
+                            const mm = String(Math.floor((secs%3600)/60)).padStart(2,'0');
+                            const ss = String(secs%60).padStart(2,'0');
+                            elapsedEl.innerText = (Math.floor(secs/3600) > 0) ? `⏱ ${hh}:${mm}:${ss}` : `⏱ ${mm}:${ss}`;
+                            elapsedEl.style.display = 'inline';
+                        }
+                        if (stopBtnEl) stopBtnEl.style.display = 'inline-block';
+                    } else {
+                        gbadge.classList.remove('state-running');
+                        gbadge.classList.add('state-idle');
+                        if (txt) txt.innerText = '⏸ 当前空闲';
+                        gbadge.title = '当前没有正在运行的托管任务';
+                        TASK_RUN_START_TS = null;
+                        if (elapsedEl) elapsedEl.style.display = 'none';
+                        if (stopBtnEl) stopBtnEl.style.display = 'none';
+                    }
+                }
+
+                if (st && st.running) {
                     if (badge) badge.innerHTML = `<span style="color: var(--claude-clay); font-weight: 600;">⚡ 正在执行任务...</span>`;
                     if (btnDaily) { btnDaily.disabled = true; btnDaily.style.opacity = '0.5'; }
                     if (btnStop) { btnStop.disabled = false; btnStop.style.opacity = '1'; }
@@ -3162,29 +3985,107 @@ APP_PAGE = """<!DOCTYPE html>
             }).catch(() => {});
         }
 
+        let GLOBAL_STATUS_TIMER = null;
+        let GLOBAL_ELAPSED_TIMER = null;
+        function startTaskStatusPolling() {
+            if (GLOBAL_STATUS_TIMER) return;
+            GLOBAL_STATUS_TIMER = setInterval(loadTaskStatus, 5000);
+            // 秒级刷新已运行时长
+            GLOBAL_ELAPSED_TIMER = setInterval(() => {
+                const elapsedEl = document.getElementById('gtbElapsed');
+                if (elapsedEl && elapsedEl.style.display !== 'none' && TASK_RUN_START_TS !== null) {
+                    const secs = Math.floor((Date.now() - TASK_RUN_START_TS) / 1000);
+                    const mm = String(Math.floor(secs/60)).padStart(2,'0');
+                    const ss = String(secs%60).padStart(2,'0');
+                    elapsedEl.innerText = `⏱ ${mm}:${ss}`;
+                }
+            }, 1000);
+        }
+
         // --- 今日运行终端日志渲染 ---
+        let logViewMode = localStorage.getItem('ark_log_view_mode') || 'human';
+
+        function setLogViewMode(mode) {
+            logViewMode = (mode === 'raw') ? 'raw' : 'human';
+            localStorage.setItem('ark_log_view_mode', logViewMode);
+            const btnH = document.getElementById('btnLogHuman');
+            const btnR = document.getElementById('btnLogRaw');
+            if (btnH && btnR) {
+                if (logViewMode === 'human') {
+                    btnH.classList.add('active');
+                    btnR.classList.remove('active');
+                } else {
+                    btnR.classList.add('active');
+                    btnH.classList.remove('active');
+                }
+            }
+            loadTodayLogs();
+        }
+
+        // --- 今日运行终端日志渲染 (支持人类可读翻译层与原始终端视图) ---
         function loadTodayLogs() {
             const term = document.getElementById('logTerminal');
             if (!term) return;
-            fetch('/api/log_today').then(r => r.json()).then(data => {
-                const logs = (data && data.logs) ? data.logs : [];
-                if (!logs.length) {
-                    term.innerHTML = '<span style="color: var(--claude-text-dim);">今日暂无运行日志。任务开始或切换账号后将自动刷新。</span>';
-                    return;
+
+            // 保持按钮激活状态同步
+            const btnH = document.getElementById('btnLogHuman');
+            const btnR = document.getElementById('btnLogRaw');
+            if (btnH && btnR) {
+                if (logViewMode === 'human') {
+                    btnH.classList.add('active');
+                    btnR.classList.remove('active');
+                } else {
+                    btnR.classList.add('active');
+                    btnH.classList.remove('active');
                 }
-                term.innerHTML = logs.map(l => {
-                    let color = '#81c784';
-                    if (/\\[WAR\\]|WARN/i.test(l)) color = '#ffb74d';
-                    else if (/\\[ERR\\]|ERROR|失败|异常/i.test(l)) color = '#e57373';
-                    else if (/TaskChainCompleted|Success/i.test(l)) color = '#4fc3f7';
-                    return `<span style="color:${color};">${escapeHtml(l)}</span>`;
-                }).join(String.fromCharCode(10));
-                term.scrollTop = term.scrollHeight;
+            }
+
+            fetch('/api/log_today').then(r => r.json()).then(data => {
+                if (logViewMode === 'human') {
+                    const hlogs = (data && data.human_logs) ? data.human_logs : [];
+                    if (!hlogs.length) {
+                        term.innerHTML = '<span style="color: var(--claude-text-dim); padding: 12px; display: block;">今日暂无任务运行记录。任务开始执行后，系统将自动提炼关键事件流在此呈现。</span>';
+                        return;
+                    }
+                    const html = hlogs.map(item => {
+                        const lvl = item.level || 'info';
+                        const icon = item.icon || 'ℹ️';
+                        const t = item.time ? `[${escapeHtml(item.time)}]` : '';
+                        const title = escapeHtml(item.title || '');
+                        const desc = escapeHtml(item.desc || '');
+                        return `
+                        <div class="human-log-item level-${lvl}">
+                            <div class="human-log-time">${t}</div>
+                            <div class="human-log-icon">${icon}</div>
+                            <div class="human-log-content">
+                                <div class="human-log-title">${title}</div>
+                                ${desc ? `<div class="human-log-desc">${desc}</div>` : ''}
+                            </div>
+                        </div>`;
+                    }).join('');
+                    term.innerHTML = `<div class="human-log-list">${html}</div>`;
+                    term.scrollTop = term.scrollHeight;
+                } else {
+                    const logs = (data && data.logs) ? data.logs : [];
+                    if (!logs.length) {
+                        term.innerHTML = '<span style="color: var(--claude-text-dim);">今日暂无运行日志。任务开始或切换账号后将自动刷新。</span>';
+                        return;
+                    }
+                    term.innerHTML = logs.map(l => {
+                        let color = '#24292f'; // 默认白底深灰文字，清晰舒适
+                        if (/\\b(?:WARN|WARNING)\\b|\\[WARN\\]/i.test(l)) color = '#b06000'; // 精准黄色/琥珀告警
+                        else if (/\\b(?:ERR|ERROR|FATAL)\\b|\\[ERROR\\]|失败|异常/i.test(l)) color = '#cf222e'; // 红色报错
+                        else if (/TaskChainCompleted|AllTasksCompleted|Success/i.test(l)) color = '#0969da'; // 成功深蓝
+                        else if (/[✔+]/i.test(l)) color = '#1a7f37'; // 成功绿色
+                        return `<span style="color:${color};">${escapeHtml(l)}</span>`;
+                    }).join(String.fromCharCode(10));
+                    term.scrollTop = term.scrollHeight;
+                }
             }).catch(e => console.warn('loadTodayLogs error:', e));
         }
 
-        // --- 顶部导航 Tab 切换控制 ---
         function switchTab(tabId) {
+            lockTouch();
             document.querySelectorAll('.tab-content').forEach(tc => {
                 if (tc.id === tabId) { tc.classList.add('active'); } else { tc.classList.remove('active'); }
             });
@@ -3194,12 +4095,14 @@ APP_PAGE = """<!DOCTYPE html>
             });
 
             if (tabId === 'screen-tab') {
-                refreshScreen(true);
-                if (isScreenPollingActive && !document.hidden) {
-                    startScreenPolling();
+                if (screenMode === '30fps') {
+                    if (!document.hidden) initStreamPlayer();
+                } else if (screenMode === '0.2fps') {
+                    if (!document.hidden) { refreshScreen(true); startScreenPolling(); }
                 }
             } else {
                 stopScreenPolling();
+                stopStreamPlayer();
             }
 
             if (tabId === 'data-tab') {
@@ -3263,6 +4166,26 @@ APP_PAGE = """<!DOCTYPE html>
             });
         }
 
+        function triggerStartEmu() {
+            if (!confirm('确定开启模拟器容器吗？(约需 30-90 秒就绪)')) return;
+            const btn = document.getElementById('btnStartEmu');
+            if (btn) { btn.disabled = true; btn.innerText = '⏳ 启动中...'; }
+            fetch('/api/emulator/start', {method: 'POST'}).then(r => r.json()).then(res => {
+                if (btn) { btn.disabled = false; btn.innerText = '▶ 开启模拟器'; }
+                if (res.success) {
+                    alert('✔ ' + (res.message || '模拟器已启动并就绪'));
+                    loadTaskStatus();
+                    if (screenMode === '30fps') initStreamPlayer();
+                    else if (screenMode === '0.2fps') refreshScreen(true);
+                } else {
+                    alert('开启失败: ' + (res.message || res.error || ''));
+                }
+            }).catch(e => {
+                if (btn) { btn.disabled = false; btn.innerText = '▶ 开启模拟器'; }
+                alert('请求异常: ' + e);
+            });
+        }
+
         function triggerCloseEmu() {
             if (!confirm('确定停止模拟器容器并释放 4GB+ 内存与 GPU 资源吗？')) return;
             fetch('/api/emulator/stop', {method: 'POST'}).then(r => r.json()).then(res => {
@@ -3271,7 +4194,7 @@ APP_PAGE = """<!DOCTYPE html>
                     refreshScreen(true);
                     loadTaskStatus();
                 } else {
-                    alert('停止失败: ' + (res.error || ''));
+                    alert('停止失败: ' + (res.message || res.error || ''));
                 }
             }).catch(e => {
                 alert('请求异常: ' + e);
@@ -3283,56 +4206,282 @@ APP_PAGE = """<!DOCTYPE html>
         const container = document.getElementById('container');
         const offlinePlaceholder = document.getElementById('screen-offline');
         const privacyPlaceholder = document.getElementById('screen-privacy');
-        let startX = 0, startY = 0, isMouseDown = false, isRefreshing = false;
+        // ==================== 投屏三模式统一管理 (仅显示，纯展示无触控) ====================
+        //  '30fps'  : 30 帧/秒 H.264 硬件直通 (WebCodecs，最低延迟，画质流畅)
+        //  '0.2fps' : 0.2 帧/秒 (每 5 秒抓取一次静态截图，极低资源占用)
+        //  'off'    : 完全关闭画面传输 (零网络带宽 / 零设备算力占用)
+        let CURRENT_SESSION_TOKEN = "";
+        let screenMode = '30fps';
         let screenPollTimer = null;
-        let isScreenPollingActive = false; // 默认关闭长期截图
+        let isRefreshing = false;
+        let streamWs = null;
+        let jmuxer = null;
+        let nalBuffer = new Uint8Array(0);
+        let cachedSps = null;
+        let cachedPps = null;
+        let hasDecodedFirstKeyframe = false;
+        let fpsCounter = 0;
+        let lastFpsTime = performance.now();
 
-        function toggleScreenPolling() {
-            isScreenPollingActive = !isScreenPollingActive;
-            updateScreenPollUI();
-            if (isScreenPollingActive) {
+        function isScreenTabActive() {
+            const tab = document.getElementById('screen-tab');
+            return !!(tab && tab.classList.contains('active'));
+        }
+
+        function setScreenMode(mode) {
+            // 兼容别名与标准化参数
+            if (mode === 'stream') mode = '30fps';
+            if (mode === 'poll') mode = '0.2fps';
+            if (mode !== '30fps' && mode !== '0.2fps' && mode !== 'off') mode = '30fps';
+
+            screenMode = mode;
+            updateModeUI();
+
+            const vd = document.getElementById('screen-video');
+            const im = document.getElementById('screen');
+            const offlinePl = document.getElementById('screen-offline');
+            const privacyPl = document.getElementById('screen-privacy');
+
+            // 1. 先彻底关闭后台轮询与 WebSocket 直通流，释放后端资源
+            stopScreenPolling();
+            stopStreamPlayer();
+
+            if (privacyPl) privacyPl.style.display = 'none';
+
+            if (mode === '30fps') {
+                if (vd) {
+                    vd.style.display = 'block';
+                    vd.poster = '/screencap?t=' + Date.now();
+                }
+                if (im) im.style.display = 'none';
+                if (offlinePl) offlinePl.style.display = 'none';
+                initStreamPlayer();
+            } else if (mode === '0.2fps') {
+                if (vd) vd.style.display = 'none';
+                if (im) im.style.display = 'block';
+                if (offlinePl) offlinePl.style.display = 'none';
                 refreshScreen(true);
                 startScreenPolling();
-            } else {
-                stopScreenPolling();
+            } else if (mode === 'off') {
+                if (vd) vd.style.display = 'none';
+                if (im) im.style.display = 'none';
+                if (offlinePl) {
+                    offlinePl.style.display = 'flex';
+                    const h = offlinePl.querySelector('h3');
+                    const p = offlinePl.querySelector('p');
+                    if (h) h.innerText = '⏸ 画面传输已关闭';
+                    if (p) p.innerHTML = '已关闭实时画面传输，零网络带宽与设备算力占用。<br>点击上方「30帧」或「0.2帧」随时重新开启。';
+                }
             }
         }
 
-        function updateScreenPollUI() {
-            const btn = document.getElementById('btnToggleScreenPoll');
+        function updateModeUI() {
+            const badges = {
+                '30fps': '🟢 30帧 硬件直通 (MSE) · 延迟 <40ms',
+                '0.2fps': '🔵 0.2帧 截屏轮询 (5秒)',
+                'off': '⚪ 画面传输已关闭 · 零资源占用'
+            };
+            const colors = {
+                '30fps': ['rgba(40,167,69,0.15)', '#28a745'],
+                '0.2fps': ['rgba(64,132,214,0.15)', '#4090d6'],
+                'off': ['rgba(148,163,184,0.15)', '#94a3b8']
+            };
+            const key = (screenMode === '30fps') ? '30fps' : ((screenMode === '0.2fps') ? '0.2fps' : 'off');
+
+            const map = {
+                '30fps': document.getElementById('modeBtnStream'),
+                '0.2fps': document.getElementById('modeBtnPoll'),
+                'off': document.getElementById('modeBtnOff')
+            };
+
+            ['30fps', '0.2fps', 'off'].forEach(k => {
+                const b = map[k];
+                if (b) {
+                    if (k === key) b.classList.add('active');
+                    else b.classList.remove('active');
+                }
+            });
+
             const status = document.getElementById('screen-poll-status');
-            if (isScreenPollingActive) {
-                if (btn) {
-                    btn.innerText = '⏸ 暂停画面轮询';
-                    btn.style.background = 'rgba(217, 119, 69, 0.15)';
-                    btn.style.color = 'var(--claude-clay)';
-                    btn.style.borderColor = 'var(--claude-clay)';
-                }
-                if (status) {
-                    status.innerText = '🟢 实时轮询中 5秒间隔';
-                    status.style.background = 'rgba(40, 167, 69, 0.15)';
-                    status.style.color = '#28a745';
-                }
-            } else {
-                if (btn) {
-                    btn.innerText = '▶ 开启画面轮询 5秒';
-                    btn.style.background = 'var(--claude-surface)';
-                    btn.style.color = 'var(--claude-text-main)';
-                    btn.style.borderColor = 'var(--claude-border)';
-                }
-                if (status) {
-                    status.innerText = '已暂停轮询 零资源占用';
-                    status.style.background = 'rgba(100,116,139,0.15)';
-                    status.style.color = '#94a3b8';
-                }
+            if (status) {
+                status.innerText = badges[key];
+                status.style.background = colors[key][0];
+                status.style.color = colors[key][1];
             }
         }
 
+        function initStreamPlayer() {
+            const video = document.getElementById('screen-video');
+            if (!video) return;
+            const badge = document.getElementById('screen-poll-status');
+
+            stopStreamPlayer();
+
+            // 无信号看门狗：进入 30fps 后若 3 秒内未收到任何视频帧，
+            // 显示占位提示而非纯黑屏 (与 0.2fps 关屏行为一致)。
+            const _frameWatchdog = setTimeout(() => {
+                if (screenMode !== '30fps' || !isScreenTabActive()) return;
+                const im0 = document.getElementById('screen');
+                const offline0 = document.getElementById('screen-offline');
+                const priv0 = document.getElementById('screen-privacy');
+                if (priv0 && priv0.style.display === 'flex') return;
+                if (offline0) {
+                    offline0.style.display = 'flex';
+                    const h = offline0.querySelector('h3');
+                    const p = offline0.querySelector('p');
+                    if (h) h.innerText = '⏸ 暂无画面信号';
+                    if (p) p.innerHTML = '模拟器休眠或暂时无画面输出。<br>启动模拟器后将自动恢复 30 帧直通画面。';
+                }
+            }, 3000);
+
+            if (badge) {
+                badge.innerText = "🟡 30帧 正在连接直通流...";
+                badge.style.background = "rgba(217, 119, 69, 0.15)";
+                badge.style.color = "#d97706";
+            }
+
+            try {
+                if (typeof JMuxer !== 'undefined') {
+                    jmuxer = new JMuxer({
+                        node: 'screen-video',
+                        mode: 'video',
+                        flushingTime: 0,
+                        clearBuffer: true,
+                        fps: 30,
+                        debug: false,
+                        onError: function(data) {
+                            console.warn('JMuxer warning:', data);
+                        }
+                    });
+                } else {
+                    console.error('JMuxer 脚本未加载！');
+                }
+            } catch(e) {
+                console.error('JMuxer 初始化异常:', e);
+            }
+
+            const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+            const sToken = window.CURRENT_SESSION_TOKEN || localStorage.getItem('ark_session_token') || '';
+            const wsParam = sToken ? `?token=${encodeURIComponent(sToken)}` : '';
+            const wsUrl = `${proto}//${location.host}/ws/stream${wsParam}`;
+
+            streamWs = new WebSocket(wsUrl);
+            streamWs.binaryType = 'arraybuffer';
+
+            streamWs.onopen = () => {
+                if (badge && (screenMode === '30fps' || screenMode === 'stream')) {
+                    badge.innerText = "🟢 30帧 直通已就绪，正在播放...";
+                    badge.style.background = "rgba(40,167,69,0.15)";
+                    badge.style.color = "#28a745";
+                }
+                if (video) {
+                    video.muted = true;
+                    video.play().catch(() => {});
+                }
+            };
+
+            streamWs.onmessage = (evt) => {
+                if (typeof evt.data === 'string' || screenMode !== '30fps') return;
+                const raw = new Uint8Array(evt.data);
+                if (raw.length === 0) return;
+
+                // 判定是否为「帧」(VCL NALU: 类型 1=非关键帧, 5=关键帧)，
+                // 仅按真实帧计数，避免把 SPS/PPS/SEI 也计入导致帧率虚高。
+                let isFrame = false;
+                try {
+                    let off = 0;
+                    if (raw[0] === 0 && raw[1] === 0 && raw[2] === 0 && raw[3] === 1) off = 4;
+                    else if (raw[0] === 0 && raw[1] === 0 && raw[2] === 1) off = 3;
+                    const ntype = raw[off] & 0x1f;
+                    if (ntype === 1 || ntype === 5) isFrame = true;
+                } catch(e) {}
+
+                if (isFrame) {
+                    // 收到真实帧：取消看门狗并隐藏占位
+                    try { clearTimeout(_frameWatchdog); } catch(e) {}
+                    const offline1 = document.getElementById('screen-offline');
+                    if (offline1) offline1.style.display = 'none';
+                    const vd1 = document.getElementById('screen-video');
+                    if (vd1) vd1.style.display = 'block';
+                }
+
+                if (jmuxer) {
+                    try {
+                        jmuxer.feed({
+                            video: raw
+                        });
+                    } catch(e) {
+                        console.warn('JMuxer feed error:', e);
+                    }
+                    if (isFrame) fpsCounter++;
+                    const now = performance.now();
+                    if (now - lastFpsTime >= 1000) {
+                        let fps = Math.round(fpsCounter * 1000 / (now - lastFpsTime));
+                        if (fps > 30) fps = 30;  // 硬性上限 30 帧/秒
+                        fpsCounter = 0;
+                        lastFpsTime = now;
+                        if (badge && (screenMode === '30fps' || screenMode === 'stream')) {
+                            badge.innerText = `🟢 30帧 硬件直通 (${fps} FPS) · 延迟 <40ms`;
+                            badge.style.background = 'rgba(40,167,69,0.15)';
+                            badge.style.color = '#28a745';
+                        }
+                    }
+                }
+            };
+
+            streamWs.onclose = () => {
+                if (screenMode === '30fps') {
+                    if (badge) badge.innerText = "⏸ 30帧 模拟器休眠待命";
+                    // 无信号时显示占位提示，避免只剩纯黑屏
+                    const im0 = document.getElementById('screen');
+                    const offline0 = document.getElementById('screen-offline');
+                    const priv0 = document.getElementById('screen-privacy');
+                    if (im0) im0.style.display = 'none';
+                    if (priv0 && priv0.style.display !== 'flex' && offline0) {
+                        offline0.style.display = 'flex';
+                        const h = offline0.querySelector('h3');
+                        const p = offline0.querySelector('p');
+                        if (h) h.innerText = '⏸ 暂无画面信号';
+                        if (p) p.innerHTML = '模拟器休眠或暂时无画面输出。<br>模拟器启动后将自动恢复 30 帧直通画面。';
+                    }
+                    if (!document.hidden && isScreenTabActive()) {
+                        setTimeout(() => {
+                            if (screenMode === '30fps' && !document.hidden && isScreenTabActive()) {
+                                initStreamPlayer();
+                            }
+                        }, 2000);
+                    }
+                }
+            };
+        }
+
+        function stopStreamPlayer() {
+            if (streamWs) {
+                try {
+                    streamWs.onopen = null;
+                    streamWs.onmessage = null;
+                    streamWs.onclose = null;
+                    streamWs.onerror = null;
+                    streamWs.close();
+                } catch(e) {}
+                streamWs = null;
+            }
+            if (jmuxer) {
+                try {
+                    jmuxer.destroy();
+                } catch(e) {}
+                jmuxer = null;
+            }
+            fpsCounter = 0;
+        }
+
+        // ==================== 0.2帧 截屏轮询 (每 5 秒刷新一次) ====================
         function startScreenPolling() {
-            if (screenPollTimer) clearInterval(screenPollTimer);
-            // 精准 5 秒截一张
+            stopScreenPolling();
             screenPollTimer = setInterval(() => {
-                refreshScreen(false);
+                if (screenMode === '0.2fps' && !document.hidden && isScreenTabActive()) {
+                    refreshScreen(false);
+                }
             }, 5000);
         }
 
@@ -3345,19 +4494,21 @@ APP_PAGE = """<!DOCTYPE html>
 
         function refreshScreen(force = false) {
             if (isRefreshing && !force) return;
-            const tab = document.getElementById('screen-tab');
-            if (!force && (document.hidden || !tab || !tab.classList.contains('active') || !isScreenPollingActive)) {
+            if (!force && (document.hidden || !isScreenTabActive() || screenMode !== '0.2fps')) {
                 return;
             }
             isRefreshing = true;
 
             fetch('/screencap?t=' + Date.now()).then(r => {
                 isRefreshing = false;
+                const im = document.getElementById('screen');
+                const offlinePl = document.getElementById('screen-offline');
+                const privacyPl = document.getElementById('screen-privacy');
+
                 if (r.status === 403) {
-                    // 触发多用户隐私屏蔽
-                    img.style.display = 'none';
-                    if (offlinePlaceholder) offlinePlaceholder.style.display = 'none';
-                    if (privacyPlaceholder) privacyPlaceholder.style.display = 'flex';
+                    if (im) im.style.display = 'none';
+                    if (offlinePl) offlinePl.style.display = 'none';
+                    if (privacyPl) privacyPl.style.display = 'flex';
                     return null;
                 }
                 if (r.status === 200) {
@@ -3366,44 +4517,1478 @@ APP_PAGE = """<!DOCTYPE html>
                 throw new Error('Offline');
             }).then(blob => {
                 if (!blob) return;
-                const objectUrl = URL.createObjectURL(blob);
-                img.style.display = 'block';
-                if (offlinePlaceholder) offlinePlaceholder.style.display = 'none';
-                if (privacyPlaceholder) privacyPlaceholder.style.display = 'none';
-                img.src = objectUrl;
+                const im = document.getElementById('screen');
+                const offlinePl = document.getElementById('screen-offline');
+                const privacyPl = document.getElementById('screen-privacy');
+
+                if (screenMode === '0.2fps') {
+                    if (im) {
+                        im.src = URL.createObjectURL(blob);
+                        im.style.display = 'block';
+                    }
+                    if (offlinePl) offlinePl.style.display = 'none';
+                    if (privacyPl) privacyPl.style.display = 'none';
+                }
             }).catch(() => {
-                img.style.display = 'none';
-                if (offlinePlaceholder) offlinePlaceholder.style.display = 'flex';
-                if (privacyPlaceholder) privacyPlaceholder.style.display = 'none';
+                const im = document.getElementById('screen');
+                const offlinePl = document.getElementById('screen-offline');
+                if (screenMode === '0.2fps') {
+                    if (im) im.style.display = 'none';
+                    if (offlinePl) offlinePl.style.display = 'flex';
+                }
             });
+        }
+
+        // ==================== MAA 桌面版面板与触控安全引擎 ====================
+        let CURRENT_MAA_CONFIG = null;
+        let CURRENT_MAA_TIMERS = null;
+        let CURRENT_MAA_ALL_SLOTS = [];
+        let COPILOT_JOB_LIST = [];
+        let touchUnlocked = false;
+        let touchAutoLockTimer = null;
+
+        function updateTouchUI() {
+            const badge = document.getElementById('touchLockStatusBadge');
+            const btn = document.getElementById('btnToggleTouch');
+            const container = document.getElementById('container');
+
+            if (touchUnlocked) {
+                if (badge) {
+                    badge.innerText = '🟢 屏幕触控已激活 (可点击/拖拽滑动)';
+                    badge.style.background = 'rgba(40, 167, 69, 0.15)';
+                    badge.style.color = '#28a745';
+                }
+                if (btn) {
+                    btn.innerText = '🔒 立即锁定触控';
+                    btn.style.color = 'var(--claude-clay)';
+                }
+                if (container) {
+                    container.style.pointerEvents = 'auto';
+                    container.style.cursor = 'crosshair';
+                }
+            } else {
+                if (badge) {
+                    badge.innerText = '🔒 屏幕触控已安全锁定';
+                    badge.style.background = 'rgba(100, 116, 139, 0.15)';
+                    badge.style.color = '#94a3b8';
+                }
+                if (btn) {
+                    btn.innerText = '🔓 解锁屏幕触控';
+                    btn.style.color = '';
+                }
+                if (container) {
+                    container.style.pointerEvents = 'none';
+                    container.style.cursor = 'default';
+                }
+            }
+        }
+
+        function resetTouchTimer() {
+            if (touchAutoLockTimer) clearTimeout(touchAutoLockTimer);
+            if (touchUnlocked) {
+                touchAutoLockTimer = setTimeout(() => {
+                    lockTouch();
+                    console.log('[Touch] 5分钟无操作，已自动安全上锁');
+                }, 5 * 60 * 1000);
+            }
+        }
+
+        function lockTouch() {
+            touchUnlocked = false;
+            if (touchAutoLockTimer) {
+                clearTimeout(touchAutoLockTimer);
+                touchAutoLockTimer = null;
+            }
+            updateTouchUI();
+        }
+
+        function toggleScreenTouch() {
+            if (touchUnlocked) {
+                lockTouch();
+                return;
+            }
+            const curAcc = getCurrentAccount();
+            const curUser = (typeof CURRENT_USER !== 'undefined' && CURRENT_USER) ? CURRENT_USER : {};
+            const isOwner = (curUser.role === 'admin' || (curAcc && curAcc.owner_username === curUser.username));
+            if (!isOwner) {
+                alert('安全拦截：当前画面不属于您的账号环境，无法解锁触控！');
+                return;
+            }
+            touchUnlocked = true;
+            updateTouchUI();
+            resetTouchTimer();
+        }
+
+        function sendAdbText() {
+            const inp = document.getElementById('adbTextInput');
+            const val = inp ? inp.value.trim() : '';
+            if (!val) return;
+            fetch(`/text?val=${encodeURIComponent(val)}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.status === 'ok') {
+                        if (inp) inp.value = '';
+                        resetTouchTimer();
+                    } else if (res.error) {
+                        alert('发送失败: ' + (res.message || res.error));
+                    }
+                }).catch(e => alert('发送异常: ' + e));
+        }
+
+        function sendAdbKey(code) {
+            fetch(`/key?code=${code}`)
+                .then(r => r.json())
+                .then(res => {
+                    resetTouchTimer();
+                }).catch(e => console.warn('sendAdbKey error:', e));
+        }
+
+        function initScreenInteraction() {
+            const container = document.getElementById('container');
+            if (!container) return;
+
+            let isDown = false;
+            let startX = 0, startY = 0, startTime = 0;
+
+            container.addEventListener('pointerdown', (e) => {
+                if (!touchUnlocked) return;
+                isDown = true;
+                const rect = container.getBoundingClientRect();
+                startX = e.clientX - rect.left;
+                startY = e.clientY - rect.top;
+                startTime = Date.now();
+                resetTouchTimer();
+            });
+
+            container.addEventListener('pointerup', (e) => {
+                if (!touchUnlocked || !isDown) return;
+                isDown = false;
+                const rect = container.getBoundingClientRect();
+                const endX = e.clientX - rect.left;
+                const endY = e.clientY - rect.top;
+                const dx = endX - startX;
+                const dy = endY - startY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const duration = Math.max(100, Math.min(800, Date.now() - startTime));
+
+                const realX1 = Math.max(0, Math.min(1280, Math.round((startX / container.clientWidth) * 1280)));
+                const realY1 = Math.max(0, Math.min(720, Math.round((startY / container.clientHeight) * 720)));
+                const realX2 = Math.max(0, Math.min(1280, Math.round((endX / container.clientWidth) * 1280)));
+                const realY2 = Math.max(0, Math.min(720, Math.round((endY / container.clientHeight) * 720)));
+
+                if (dist > 15) {
+                    fetch(`/swipe?x1=${realX1}&y1=${realY1}&x2=${realX2}&y2=${realY2}&duration=${duration}`)
+                        .catch(err => console.warn('swipe err:', err));
+                } else {
+                    fetch(`/tap?x=${realX1}&y=${realY1}`)
+                        .catch(err => console.warn('tap err:', err));
+                }
+                resetTouchTimer();
+            });
+        }
+
+        function switchMaaSubTab(subId) {
+            document.querySelectorAll('.maa-subcontent').forEach(el => {
+                el.style.display = (el.id === subId) ? 'block' : 'none';
+            });
+            document.querySelectorAll('.maa-subnav-btn').forEach(btn => {
+                const oc = btn.getAttribute('onclick') || '';
+                if (oc.indexOf("'" + subId + "'") !== -1) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
+            if (subId === 'maa-tab-timers') {
+                loadMaaTimersForCurrentAccount();
+            } else if (subId === 'maa-tab-copilot') {
+                loadCopilotJobList();
+            } else if (subId === 'maa-tab-logs') {
+                loadTodayLogs();
+            }
+        }
+
+        let CURRENT_MAA_TASK_SCHEMA = {};
+        let CURRENT_MAA_TASK_CATALOG = [];
+        let CURRENT_COPILOT_USER_ADDITIONAL = [];
+        let CURRENT_MAA_INFRAST_FILES = [];
+        let CURRENT_MAA_CHIP_DROP_OPTIONS = [];
+        let CURRENT_MAA_DROP_STAGE_MAP = {};
+        let CURRENT_MAA_STAGES = null;
+
+        function loadMaaConfigForCurrentAccount(explicitAccId) {
+            const acc = explicitAccId ? { id: explicitAccId } : getCurrentAccount();
+            if (!acc || !acc.id) return;
+
+            const titleEl = document.getElementById('maaCurrentAccountTitle');
+            if (titleEl) titleEl.innerText = acc.name || acc.id;
+            const statusEl = document.getElementById('maaTaskStatusBadge');
+            if (statusEl) statusEl.innerText = '正在加载配置…';
+
+            fetch(`/api/maa/config?account_id=${acc.id}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success && res.config) {
+                        CURRENT_MAA_CONFIG = res.config;
+                        if (res.task_schema) CURRENT_MAA_TASK_SCHEMA = res.task_schema;
+                        if (res.task_catalog) CURRENT_MAA_TASK_CATALOG = res.task_catalog;
+                        CURRENT_MAA_INFRAST_FILES = res.infrast_files || [];
+                        CURRENT_MAA_CHIP_DROP_OPTIONS = res.chip_drop_options || [];
+                        CURRENT_MAA_DROP_STAGE_MAP = res.drop_stage_map || {};
+                        renderMaaTaskQueueList(res.config.TaskQueue || []);
+                        renderCopilotFormFromConfig(res.config.Copilot || {});
+                        updateMaaPanelStatusBadge();
+                    }
+                }).catch(e => { console.warn('loadMaaConfig error:', e); const s=document.getElementById('maaTaskStatusBadge'); if (s) s.innerText = '配置加载失败'; });
+        }
+
+        function updateMaaPanelStatusBadge() {
+            const el = document.getElementById('maaTaskStatusBadge');
+            if (!el) return;
+            const q = (CURRENT_MAA_CONFIG && CURRENT_MAA_CONFIG.TaskQueue) || [];
+            const enabled = q.filter(t => t.IsEnable !== false).length;
+            const total = q.length;
+            if (total === 0) { el.innerText = '队列为空 · 请添加任务'; return; }
+            el.innerText = `共 ${total} 项任务 · ${enabled} 项已启用（启动时按序执行）`;
+        }
+
+        function renderMaaTaskQueueList(queue) {
+            const listEl = document.getElementById('maa-queue-list');
+            if (!listEl) return;
+            if (!queue || queue.length === 0) {
+                listEl.innerHTML = '<div style="color:var(--claude-text-dim);padding:14px;text-align:center;">暂无长草任务配置，请点击上方【➕ 添加任务】添加</div>';
+                return;
+            }
+
+            const icons = {
+                'StartUpTask': '⚡',
+                'RecruitTask': '📋',
+                'InfrastTask': '🏢',
+                'FightTask': '⚔️',
+                'AnnihilationTask': '🛡️',
+                'DepotMaintainTask': '📦',
+                'MallTask': '🛒',
+                'AwardTask': '🎁',
+                'UserDataUpdateTask': '📊'
+            };
+
+            let html = '';
+            queue.forEach((task, idx) => {
+                const type = task['$type'] || '';
+                const icon = icons[type] || '📌';
+                const name = task.Name || type;
+                const isEnabled = Boolean(task.IsEnable);
+
+                html += `
+                <div class="maa-task-card" id="maa-task-card-${idx}">
+                    <div class="maa-task-header" onclick="toggleMaaTaskExpand(${idx})">
+                        <div class="maa-task-left">
+                            <input type="checkbox" class="maa-task-toggle" id="task-toggle-${idx}" ${isEnabled ? 'checked' : ''} onclick="event.stopPropagation(); updateMaaTaskEnable(${idx}, this.checked)" title="启用/禁用此任务" />
+                            <span style="font-size:14px;">${icon}</span>
+                            <span class="maa-task-title" id="maa-task-title-${idx}">${escapeHtml(name)}</span>
+                            <span class="maa-task-desc">${escapeHtml(getMaaTaskSummary(task))}</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:4px;" onclick="event.stopPropagation()">
+                            <button type="button" class="maa-task-action-btn" onclick="renameMaaTask(${idx})" title="重命名此任务">✎</button>
+                            <button type="button" class="maa-task-action-btn" onclick="moveMaaTask(${idx}, -1)" ${idx === 0 ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''} title="向上移动次序">⬆</button>
+                            <button type="button" class="maa-task-action-btn" onclick="moveMaaTask(${idx}, 1)" ${idx === queue.length - 1 ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''} title="向下移动次序">⬇</button>
+                            <button type="button" class="maa-task-action-btn" style="color:var(--claude-danger);" onclick="deleteMaaTask(${idx})" title="删除此任务">🗑</button>
+                            <button type="button" class="maa-task-expand-btn" onclick="toggleMaaTaskExpand(${idx})">设置 ▾</button>
+                        </div>
+                    </div>
+                    <div class="maa-task-body" id="maa-task-body-${idx}">
+                        ${renderMaaTaskDetailForm(task, idx)}
+                    </div>
+                </div>`;
+            });
+            listEl.innerHTML = html;
+        }
+
+        function renameMaaTask(idx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[idx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[idx];
+            const oldName = t.Name || t['$type'] || '任务';
+            const input = prompt('重命名任务（可自由命名，方便区分多个同类任务）:', oldName);
+            if (input === null) return;
+            const newName = input.trim();
+            if (!newName) { alert('任务名称不能为空'); return; }
+            t.Name = newName;
+            const titleEl = document.getElementById(`maa-task-title-${idx}`);
+            if (titleEl) titleEl.innerText = newName;
+            rerenderMaaTaskBody(idx);
+        }
+
+        function syncMaaTaskTitle(idx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[idx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[idx];
+            const titleEl = document.getElementById(`maa-task-title-${idx}`);
+            if (titleEl) titleEl.innerText = t.Name || t['$type'] || '任务';
+        }
+
+        function toggleMaaTaskExpand(idx) {
+            const card = document.getElementById(`maa-task-card-${idx}`);
+            if (card) card.classList.toggle('expanded');
+            if (card && card.classList.contains('expanded')) {
+                requestAnimationFrame(() => card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+            }
+        }
+
+        function updateMaaTaskEnable(idx, enabled) {
+            if (CURRENT_MAA_CONFIG && CURRENT_MAA_CONFIG.TaskQueue && CURRENT_MAA_CONFIG.TaskQueue[idx]) {
+                CURRENT_MAA_CONFIG.TaskQueue[idx].IsEnable = enabled;
+                updateMaaPanelStatusBadge();
+            }
+        }
+
+        function moveMaaTask(idx, dir) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue) return;
+            const q = CURRENT_MAA_CONFIG.TaskQueue;
+            const targetIdx = idx + dir;
+            if (targetIdx < 0 || targetIdx >= q.length) return;
+            const moved = q.splice(idx, 1)[0];
+            q.splice(targetIdx, 0, moved);
+            renderMaaTaskQueueList(q);
+            toggleMaaTaskExpand(targetIdx);
+        }
+
+        function deleteMaaTask(idx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[idx];
+            const name = t ? (t.Name || t['$type']) : '此任务';
+            if (!confirm(`确定从任务队列中删除【${name}】吗？`)) return;
+            CURRENT_MAA_CONFIG.TaskQueue.splice(idx, 1);
+            renderMaaTaskQueueList(CURRENT_MAA_CONFIG.TaskQueue);
+        }
+
+        function openAddMaaTaskModal() {
+            const listEl = document.getElementById('maa-add-task-catalog-list');
+            const m = document.getElementById('modal-add-maa-task');
+            if (!listEl || !m) return;
+
+            let html = '';
+            (CURRENT_MAA_TASK_CATALOG || []).forEach(cat => {
+                html += `
+                <div class="card" style="padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;background:var(--claude-surface);border:1px solid var(--claude-border-subtle);border-radius:6px;transition:background 0.2s;" onmouseover="this.style.background='var(--claude-surface-hover)'" onmouseout="this.style.background='var(--claude-surface)'" onclick="confirmAddMaaTask('${cat.type}', '${escapeHtml(cat.name)}')">
+                    <div style="display:flex;gap:10px;align-items:center;">
+                        <span style="font-size:20px;">${cat.icon}</span>
+                        <div>
+                            <div style="font-weight:600;font-size:13px;color:var(--claude-text-main);">${escapeHtml(cat.name)} <span style="font-size:11px;color:var(--claude-text-dim);font-family:var(--font-mono);">(${cat.type})</span></div>
+                            <div style="font-size:11px;color:var(--claude-text-muted);">${escapeHtml(cat.desc)}</div>
+                        </div>
+                    </div>
+                    <button type="button" class="btn-action" style="font-size:11px;padding:4px 10px;color:var(--claude-clay);border-color:var(--claude-clay);font-weight:600;">+ 加入队列</button>
+                </div>`;
+            });
+            listEl.innerHTML = html;
+            m.classList.add('show');
+            m.style.display = 'flex';
+        }
+
+        function closeAddMaaTaskModal() {
+            const m = document.getElementById('modal-add-maa-task');
+            if (m) {
+                m.classList.remove('show');
+                m.style.display = 'none';
+            }
+        }
+
+        function confirmAddMaaTask(taskType, taskName) {
+            if (!CURRENT_MAA_CONFIG) CURRENT_MAA_CONFIG = { TaskQueue: [] };
+            if (!CURRENT_MAA_CONFIG.TaskQueue) CURRENT_MAA_CONFIG.TaskQueue = [];
+
+            let newTask = { "$type": taskType, "Name": taskName, "IsEnable": true };
+            const schemaFields = CURRENT_MAA_TASK_SCHEMA[taskType] || [];
+            schemaFields.forEach(f => {
+                if (f.default !== undefined) {
+                    try {
+                        newTask[f.key] = JSON.parse(JSON.stringify(f.default));
+                    } catch(e) {
+                        newTask[f.key] = f.default;
+                    }
+                }
+            });
+
+            CURRENT_MAA_CONFIG.TaskQueue.push(newTask);
+            closeAddMaaTaskModal();
+            renderMaaTaskQueueList(CURRENT_MAA_CONFIG.TaskQueue);
+            const newIdx = CURRENT_MAA_CONFIG.TaskQueue.length - 1;
+            toggleMaaTaskExpand(newIdx);
+        }
+
+        function getMaaTaskSummary(t) {
+            const type = t['$type'];
+            if (type === 'StartUpTask') return t.AccountName ? `尾号: ${t.AccountName}` : '当前会话环境';
+            if (type === 'RecruitTask') return `上限 ${t.MaxTimes || 4} 次 · ${t.Level6Choose ? '自动确认高资' : '高资告警人工'}`;
+            if (type === 'InfrastTask') {
+                const modeLabel = { 'Default': '常规模式', 'Rotation': '队列轮换', 'Custom': '自定义配置' }[t.Mode] || '常规模式';
+                return t.Mode === 'Custom' ? `${modeLabel} · ${t.Filename || '未导入文件'}` : modeLabel;
+            }
+            if (type === 'AnnihilationTask') {
+                const cur = t.Stage && t.Stage !== 'Annihilation' ? '常驻' : '当期';
+                return `剿灭 (${cur})`;
+            }
+            if (type === 'FightTask') {
+                const stages = Array.isArray(t.StagePlan) ? t.StagePlan.join(', ') : (t.Stage || '1-7');
+                const extra = t.SanityOnly ? '剩余理智' : '理智作战';
+                return `${extra}: ${stages || '1-7'}${t.UseWeeklySchedule ? ' (周计划)' : ''}`;
+            }
+            if (type === 'DepotMaintainTask') {
+                const n = (t.PlanList || []).length;
+                return `库存保持 (${n} 条芯片计划)`;
+            }
+            if (type === 'MallTask') return '信用商店购物与好友拜访';
+            if (type === 'AwardTask') return '日常/邮件/单抽/采矿奖励';
+            if (type === 'UserDataUpdateTask') return '全量仓库与干员列表刷新';
+            return '';
+        }
+
+        function maaFieldVisible(f, t) {
+            if (f.showWhen) {
+                for (const k in f.showWhen) {
+                    if (String(t[k]) !== String(f.showWhen[k])) return false;
+                }
+            }
+            if (f.hideWhen) {
+                for (const k in f.hideWhen) {
+                    if (String(t[k]) === String(f.hideWhen[k])) return false;
+                }
+            }
+            return true;
+        }
+
+        function renderMaaTaskDetailForm(t, idx) {
+            const type = t['$type'];
+            let fields = CURRENT_MAA_TASK_SCHEMA[type] || [];
+            // 剩余理智：仅保留关卡选择, 且改为单关卡控件
+            if (t.SanityOnly) {
+                fields = fields.filter(f => f.key === 'StagePlan').map(f => Object.assign({}, f, { type: 'sanity_stage', label: '剩余理智刷取关卡 (仅单个)' }));
+            }
+
+            // 通用任务名称编辑 (所有任务均可自由命名)
+            let body = `
+            <div class="form-row">
+                <div style="display:flex;flex-direction:column;">
+                    <span>任务名称</span>
+                    <span style="font-size:10px;color:var(--claude-text-dim);">可自由命名，便于区分多个同类任务</span>
+                </div>
+                <input type="text" class="form-input" style="flex:1;max-width:240px;margin-bottom:0;" value="${escapeHtml(t.Name || type)}" placeholder="任务名称" onchange="updateMaaTaskField(${idx}, 'Name', this.value); syncMaaTaskTitle(${idx})" />
+            </div>`;
+
+            if (!fields || fields.length === 0) {
+                return body + '<div style="color:var(--claude-text-dim);font-size:11px;">按官方标准默认算法执行。</div>';
+            }
+
+            fields.forEach(f => {
+                if (!maaFieldVisible(f, t)) return;
+                const key = f.key;
+                let val = t[key];
+                if (val === undefined) val = f.default;
+
+                if (f.type === 'bool') {
+                    body += `
+                    <div class="form-row">
+                        <div style="display:flex;flex-direction:column;">
+                            <span>${escapeHtml(f.label)}</span>
+                            ${f.hint ? `<span style="font-size:10px;color:var(--claude-text-dim);">${escapeHtml(f.hint)}</span>` : ''}
+                        </div>
+                        <input type="checkbox" ${val ? 'checked' : ''} onchange="updateMaaTaskField(${idx}, '${key}', this.checked); rerenderMaaTaskBody(${idx})" />
+                    </div>`;
+                } else if (f.type === 'number') {
+                    body += `
+                    <div class="form-row">
+                        <span>${escapeHtml(f.label)}</span>
+                        <input type="number" class="form-input" style="width:90px;text-align:center;margin-bottom:0;" min="${f.min !== undefined ? f.min : 0}" max="${f.max !== undefined ? f.max : 999999}" value="${val !== undefined ? val : (f.default||0)}" onchange="updateMaaTaskField(${idx}, '${key}', parseInt(this.value)||0)" />
+                    </div>`;
+                } else if (f.type === 'text') {
+                    const ph = f.key === 'AccountName' ? '仅填尾号，如 4567' : (f.hint || '');
+                    body += `
+                    <div class="form-row">
+                        <div style="display:flex;flex-direction:column;">
+                            <span>${escapeHtml(f.label)}</span>
+                            ${f.hint ? `<span style="font-size:10px;color:var(--claude-text-dim);">${escapeHtml(f.hint)}</span>` : ''}
+                        </div>
+                        <input type="text" class="form-input" style="flex:1;max-width:240px;margin-bottom:0;" value="${escapeHtml(val || '')}" placeholder="${escapeHtml(ph)}" onchange="updateMaaTaskField(${idx}, '${key}', this.value)" />
+                    </div>`;
+                } else if (f.type === 'select') {
+                    let opts = '';
+                    (f.options || []).forEach(o => {
+                        const sel = String(val) === String(o.value) ? 'selected' : '';
+                        opts += `<option value="${escapeHtml(o.value)}" ${sel}>${escapeHtml(o.label)}</option>`;
+                    });
+                    body += `
+                    <div class="form-row">
+                        <div style="display:flex;flex-direction:column;">
+                            <span>${escapeHtml(f.label)}</span>
+                            ${f.hint ? `<span style="font-size:10px;color:var(--claude-text-dim);">${escapeHtml(f.hint)}</span>` : ''}
+                        </div>
+                        <select style="max-width:280px;margin-bottom:0;" onchange="updateMaaTaskField(${idx}, '${key}', isNaN(Number(this.value)) ? this.value : Number(this.value)); rerenderMaaTaskBody(${idx})">
+                            ${opts}
+                        </select>
+                    </div>`;
+                } else if (f.type === 'stage_list') {
+                    const strVal = Array.isArray(val) ? val.join(', ') : (val || '');
+                    body += `
+                    <div class="form-row" style="align-items:flex-start;">
+                        <div style="display:flex;flex-direction:column;">
+                            <span>${escapeHtml(f.label)}</span>
+                            <span style="font-size:10px;color:var(--claude-text-dim);">${escapeHtml(f.hint || '')}</span>
+                        </div>
+                        <input type="text" class="form-input" style="flex:1;max-width:280px;margin-bottom:0;" value="${escapeHtml(strVal)}" placeholder="例如: 1-7, CE-6, Annihilation" onchange="updateMaaTaskField(${idx}, '${key}', this.value.split(/[,，\\s]+/).map(s=>s.trim()).filter(Boolean))" />
+                    </div>`;
+                } else if (f.type === 'infrast_file') {
+                    let opts = '<option value="">-- 请选择已导入的排班文件 --</option>';
+                    (CURRENT_MAA_INFRAST_FILES || []).forEach(fn => {
+                        const sel = String(val) === String(fn) ? 'selected' : '';
+                        opts += `<option value="${escapeHtml(fn)}" ${sel}>${escapeHtml(fn)}</option>`;
+                    });
+                    body += `
+                    <div class="form-row" style="align-items:flex-start;flex-direction:column;gap:4px;">
+                        <span>${escapeHtml(f.label)}</span>
+                        <div style="display:flex;gap:6px;width:100%;align-items:center;">
+                            <select style="flex:1;margin-bottom:0;max-width:none;" onchange="updateMaaTaskField(${idx}, '${key}', this.value)">
+                                ${opts}
+                            </select>
+                            <button type="button" class="btn-action" style="padding:6px 10px;font-size:11px;white-space:nowrap;" onclick="triggerMaaInfrastUpload(${idx})">📤 导入文件</button>
+                        </div>
+                        <span style="font-size:10px;color:var(--claude-text-dim);">从本地导入 MAA 基建排班 JSON；切换文件时旧文件将被服务端清理，不保留历史</span>
+                        <input type="file" id="maaInfrastFileInput" accept=".json" style="display:none;" onchange="handleMaaInfrastUpload(event, ${idx})" />
+                    </div>`;
+                } else if (f.type === 'stage_plan') {
+                    const strVal = Array.isArray(val) ? val.join(', ') : (val || '');
+                    body += `
+                    <div class="form-row" style="align-items:flex-start;flex-direction:column;gap:4px;">
+                        <div style="display:flex;flex-direction:column;width:100%;">
+                            <span>${escapeHtml(f.label)}</span>
+                            <span style="font-size:10px;color:var(--claude-text-dim);">手动输入关卡名（多个用逗号分隔，例如 1-7, CE-6, PR-A-1, Annihilation）；保存时会校验合法性</span>
+                        </div>
+                        <input type="text" id="maa-stage-input-${idx}" class="form-input" style="width:100%;margin-bottom:0;font-family:var(--font-mono);" value="${escapeHtml(strVal)}" placeholder="例如: 1-7, CE-6, PR-A-1, Annihilation" onchange="updateMaaTaskField(${idx}, '${key}', this.value.split(/[,，\\s]+/).map(s=>s.trim()).filter(Boolean)); checkMaaStageInput(${idx})" oninput="checkMaaStageInput(${idx})" />
+                        <span id="maa-stage-tip-${idx}" style="font-size:10px;color:var(--claude-text-dim);">支持：主线关卡、资源本(CE/LS/CA/AP/SK)、芯片本(PR-)、剿灭、活动关卡</span>
+                    </div>`;
+                } else if (f.type === 'plan_list') {
+                    let rows = '';
+                    const plans = Array.isArray(val) ? val : [];
+                    plans.forEach((p, pi) => {
+                        let dropOpts = '<option value="">-- 选择目标材料 --</option>';
+                        (CURRENT_MAA_CHIP_DROP_OPTIONS || []).forEach(o => {
+                            const sel = String(p.DropId) === String(o.value) ? 'selected' : '';
+                            dropOpts += `<option value="${escapeHtml(o.value)}" ${sel}>${escapeHtml(o.label)}</option>`;
+                        });
+                        rows += `
+                        <div style="display:flex;gap:6px;align-items:center;background:var(--claude-surface);padding:5px 8px;border-radius:5px;border:1px solid var(--claude-border-subtle);">
+                            <select style="flex:1;margin-bottom:0;font-size:11px;" onchange="updateMaaPlanDrop(${idx}, ${pi}, this.value)">${dropOpts}</select>
+                            <input type="text" class="form-input" style="width:78px;margin-bottom:0;font-size:11px;text-align:center;" value="${escapeHtml(p.Stage||'')}" placeholder="关卡" readonly title="由材料自动填充" />
+                            <input type="number" class="form-input" style="width:64px;margin-bottom:0;font-size:11px;text-align:center;" value="${p.DropCount||0}" min="0" onchange="updateMaaPlanField(${idx}, ${pi}, 'DropCount', parseInt(this.value)||0)" title="目标库存数量" />
+                            <button type="button" class="btn-action" style="padding:2px 6px;font-size:10px;color:var(--claude-danger);" onclick="deleteMaaPlanItem(${idx}, ${pi})">✕</button>
+                        </div>`;
+                    });
+                    body += `
+                    <div class="form-row" style="flex-direction:column;align-items:stretch;gap:6px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;">
+                            <span>${escapeHtml(f.label)}</span>
+                            <button type="button" class="btn-action" style="font-size:10px;padding:2px 8px;" onclick="addMaaPlanItem(${idx})">+ 添加计划</button>
+                        </div>
+                        <div style="display:flex;flex-direction:column;gap:5px;">${rows || '<span style="font-size:11px;color:var(--claude-text-dim);">暂无计划条目</span>'}</div>
+                    </div>`;
+                } else if (f.type === 'sanity_stage') {
+                    const arr = Array.isArray(val) ? val : (val ? [val] : []);
+                    const cur = arr[0] || '1-7';
+                    const isCustom = cur !== '1-7' && cur !== 'Current';
+                    const choices = [['1-7','1-7'],['Current','当前/上次'],['__custom__','自定义']];
+                    let chips = '';
+                    choices.forEach(([v,l]) => {
+                        const active = (v === '__custom__' ? isCustom : cur === v) ? 'active' : '';
+                        chips += `<span class="weekly-day-chip ${active}" onclick="setMaaSanityStage(${idx}, '${v}')">${l}</span>`;
+                    });
+                    body += `
+                    <div class="form-row" style="flex-direction:column;align-items:flex-start;gap:6px;">
+                        <span>${escapeHtml(f.label)}</span>
+                        <div class="weekly-days-grid">${chips}</div>
+                        <input type="text" class="form-input" style="max-width:220px;margin-bottom:0;font-size:12px;display:${isCustom?'block':'none'};font-family:var(--font-mono);" id="maa-sanity-custom-${idx}" placeholder="手动输入关卡号，如 1-7 / CE-6" value="${isCustom?escapeHtml(cur):''}" onchange="updateMaaTaskField(${idx}, 'StagePlan', [this.value.trim()]); checkMaaStageInput(${idx})" oninput="checkMaaStageInput(${idx})" />
+                        <span id="maa-stage-tip-${idx}" style="font-size:10px;color:var(--claude-text-dim);"></span>
+                    </div>`;
+                } else if (f.type === 'weekly') {
+                    const days = [
+                        {k: "Monday", l: "周一"}, {k: "Tuesday", l: "周二"}, {k: "Wednesday", l: "周三"},
+                        {k: "Thursday", l: "周四"}, {k: "Friday", l: "周五"}, {k: "Saturday", l: "周六"}, {k: "Sunday", l: "周日"}
+                    ];
+                    const ws = val || {};
+                    let chips = '';
+                    days.forEach(d => {
+                        const act = ws[d.k] ? 'active' : '';
+                        chips += `<span class="weekly-day-chip ${act}" onclick="toggleMaaWeeklyDay(${idx}, '${d.k}')">${d.l}</span>`;
+                    });
+                    body += `
+                    <div class="form-row" style="flex-direction:column;align-items:flex-start;gap:4px;">
+                        <span>${escapeHtml(f.label)}</span>
+                        <div class="weekly-days-grid">${chips}</div>
+                    </div>`;
+                }
+            });
+            return body;
+        }
+
+        function rerenderMaaTaskBody(taskIdx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const bodyEl = document.getElementById(`maa-task-body-${taskIdx}`);
+            if (bodyEl) bodyEl.innerHTML = renderMaaTaskDetailForm(CURRENT_MAA_CONFIG.TaskQueue[taskIdx], taskIdx);
+        }
+
+        function addMaaPlanItem(taskIdx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            if (!Array.isArray(t.PlanList)) t.PlanList = [];
+            t.PlanList.push({ Stage: "", DropId: "", DropCount: 0, UseMedicine: false, MedicineCount: 0, UseStone: false, StoneCount: 0 });
+            rerenderMaaTaskBody(taskIdx);
+        }
+
+        function deleteMaaPlanItem(taskIdx, pi) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            (t.PlanList || []).splice(pi, 1);
+            rerenderMaaTaskBody(taskIdx);
+        }
+
+        function updateMaaPlanField(taskIdx, pi, key, val) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            if (!Array.isArray(t.PlanList) || !t.PlanList[pi]) return;
+            t.PlanList[pi][key] = val;
+            const cardEl = document.getElementById(`maa-task-card-${taskIdx}`);
+            if (cardEl) {
+                const descEl = cardEl.querySelector('.maa-task-desc');
+                if (descEl) descEl.innerText = getMaaTaskSummary(t);
+            }
+        }
+
+        function updateMaaPlanDrop(taskIdx, pi, dropId) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            if (!Array.isArray(t.PlanList) || !t.PlanList[pi]) return;
+            t.PlanList[pi].DropId = dropId;
+            // 自动填充关卡名 (芯片 x1 默认 5, 芯片组 x2 默认 8)
+            const map = CURRENT_MAA_DROP_STAGE_MAP || {};
+            if (dropId && map[dropId]) t.PlanList[pi].Stage = map[dropId];
+            if (!t.PlanList[pi].DropCount || t.PlanList[pi].DropCount <= 0) {
+                t.PlanList[pi].DropCount = (dropId && dropId.endsWith("2")) ? 8 : 5;
+            }
+            rerenderMaaTaskBody(taskIdx);
+        }
+
+        function setMaaSanityStage(taskIdx, choice) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            if (choice === '__custom__') {
+                const cur = (Array.isArray(t.StagePlan) && t.StagePlan[0]) || "";
+                if (cur === '1-7' || cur === 'Current' || !cur) {
+                    const inp = document.getElementById(`maa-sanity-custom-${taskIdx}`);
+                    if (inp && inp.value.trim()) { t.StagePlan = [inp.value.trim()]; }
+                    else { t.StagePlan = [""]; }
+                }
+            } else {
+                t.StagePlan = [choice];
+            }
+            rerenderMaaTaskBody(taskIdx);
+        }
+
+
+        function triggerMaaInfrastUpload(taskIdx) {
+            const fi = document.getElementById('maaInfrastFileInput');
+            if (fi) { fi.dataset.taskIdx = taskIdx; fi.click(); }
+        }
+
+        function handleMaaInfrastUpload(e, taskIdx) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const acc = getCurrentAccount();
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const content = JSON.parse(evt.target.result);
+                    fetch('/api/infrast_plans/upload', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ filename: file.name, content: content, account_id: acc ? acc.id : null })
+                    }).then(r => r.json()).then(res => {
+                        if (res.success) {
+                            CURRENT_MAA_INFRAST_FILES = [res.filename];
+                            if (CURRENT_MAA_CONFIG && CURRENT_MAA_CONFIG.TaskQueue && CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) {
+                                CURRENT_MAA_CONFIG.TaskQueue[taskIdx].Filename = res.filename;
+                            }
+                            alert(`✔ 排班文件 [${res.filename}] 已导入并绑定 (该账号仅保留此文件)`);
+                            rerenderMaaTaskBody(taskIdx);
+                        } else {
+                            alert('导入失败: ' + (res.error || '未知错误'));
+                        }
+                    }).catch(err => alert('网络异常: ' + err));
+                } catch(err) {
+                    alert('文件非合法 JSON 格式！');
+                }
+                e.target.value = '';
+            };
+            reader.readAsText(file);
+        }
+
+        // 关卡名合法性校验 (与后端 maa_runner / MAA 协议一致的常见格式)
+        function isValidStageCode(s) {
+            s = (s || '').trim();
+            if (!s) return false;
+            if (s === 'Current' || s === '当前' || s === '当前/上次') return true;
+            if (['Annihilation','Chernobog@Annihilation','LungmenOutskirts@Annihilation','LungmenDowntown@Annihilation'].includes(s)) return true;
+            if (/^[0-9]{1,2}-[0-9]{1,2}(-NORMAL|-HARD)?$/i.test(s)) return true;
+            if (/^(R|TR|EG|LT)[0-9]{1,2}-[0-9]{1,2}$/i.test(s)) return true;
+            if (/^(CE|LS|CA|AP|SK)-[0-9]{1,2}$/i.test(s)) return true;
+            if (/^PR-[A-D]-[0-9]$/i.test(s)) return true;
+            if (/^[A-Za-z]{2,4}-[0-9]{1,2}$/.test(s)) return true;
+            if (/^SSReopen-[A-Za-z0-9]+$/i.test(s)) return true;
+            return false;
+        }
+
+        function checkMaaStageInput(taskIdx) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return true;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            const tipEl = document.getElementById(`maa-stage-tip-${taskIdx}`);
+            const arr = Array.isArray(t.StagePlan) ? t.StagePlan.filter(Boolean) : [];
+            const inp = document.getElementById(`maa-stage-input-${taskIdx}`);
+            if (arr.length === 0) {
+                if (tipEl) { tipEl.style.color = 'var(--claude-danger)'; tipEl.innerText = '⚠️ 请至少填写一个关卡名'; }
+                if (inp) inp.style.borderColor = 'var(--claude-danger)';
+                return false;
+            }
+            const bad = arr.filter(s => !isValidStageCode(s));
+            if (bad.length > 0) {
+                if (tipEl) { tipEl.style.color = 'var(--claude-danger)'; tipEl.innerText = `⚠️ 非法关卡名：${bad.join(', ')}（格式如 1-7 / CE-6 / PR-A-1 / Annihilation）`; }
+                if (inp) inp.style.borderColor = 'var(--claude-danger)';
+                return false;
+            }
+            if (inp) inp.style.borderColor = '';
+            if (tipEl) { tipEl.style.color = 'var(--claude-sage)'; tipEl.innerText = `✔ 关卡格式校验通过：${arr.join(', ')}`; }
+            return true;
+        }
+
+        function validateAllMaaStages() {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue) return true;
+            let ok = true;
+            CURRENT_MAA_CONFIG.TaskQueue.forEach((t, idx) => {
+                if (!t.IsEnable) return;
+                if (t['$type'] !== 'FightTask') return;
+                if (!checkMaaStageInput(idx)) ok = false;
+            });
+            return ok;
+        }
+
+        function toggleMaaWeeklyDay(taskIdx, dayKey) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            const t = CURRENT_MAA_CONFIG.TaskQueue[taskIdx];
+            if (!t.WeeklySchedule) t.WeeklySchedule = {};
+            t.WeeklySchedule[dayKey] = !t.WeeklySchedule[dayKey];
+            rerenderMaaTaskBody(taskIdx);
+        }
+
+        function updateMaaTaskField(taskIdx, key, val) {
+            if (!CURRENT_MAA_CONFIG || !CURRENT_MAA_CONFIG.TaskQueue || !CURRENT_MAA_CONFIG.TaskQueue[taskIdx]) return;
+            CURRENT_MAA_CONFIG.TaskQueue[taskIdx][key] = val;
+            const cardEl = document.getElementById(`maa-task-card-${taskIdx}`);
+            if (cardEl) {
+                const descEl = cardEl.querySelector('.maa-task-desc');
+                if (descEl) descEl.innerText = getMaaTaskSummary(CURRENT_MAA_CONFIG.TaskQueue[taskIdx]);
+            }
+        }
+
+        function saveMaaConfigForCurrentAccount() {
+            const acc = getCurrentAccount();
+            if (!acc || !acc.id || !CURRENT_MAA_CONFIG) return;
+            if (!validateAllMaaStages()) {
+                alert('⚠️ 有理智作战任务的关卡名不合法，请修正后再保存（支持格式：1-7 / CE-6 / PR-A-1 / Annihilation / 活动关卡代码）。');
+                return;
+            }
+            const btn = document.getElementById('btnSaveMaaConfig');
+            if (btn) { btn.disabled = true; btn.innerText = '保存中...'; }
+
+            fetch('/api/maa/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ account_id: acc.id, config: CURRENT_MAA_CONFIG })
+            }).then(r => r.json()).then(res => {
+                if (btn) { btn.disabled = false; btn.innerText = '💾 保存长草配置'; }
+                if (res.success) {
+                    alert('✔ MAA 桌面版长草配置已保存成功！');
+                } else if (res.error === 'invalid_stage') {
+                    alert('⚠️ ' + (res.message || '关卡名不合法，请修正后再保存'));
+                } else {
+                    alert('保存失败: ' + (res.error || '未知错误'));
+                }
+            }).catch(e => {
+                if (btn) { btn.disabled = false; btn.innerText = '💾 保存长草配置'; }
+                alert('网络异常: ' + e);
+            });
+        }
+
+        function loadMaaTimersForCurrentAccount() {
+            const acc = getCurrentAccount();
+            if (!acc || !acc.id) return;
+            fetch(`/api/maa/timers?account_id=${acc.id}`)
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success && res.timers) {
+                        CURRENT_MAA_TIMERS = res.timers;
+                        CURRENT_MAA_ALL_SLOTS = res.all_slots || [];
+                        const forceCb = document.getElementById('maaTimerForceStart');
+                        if (forceCb) forceCb.checked = (res.timers.ForceScheduledStart !== false);
+                        renderMaaTimersList(res.timers.List || [], res.window_minutes || 40);
+                        renderMaaTimelineGantt(res.all_slots || [], res.window_minutes || 40);
+                    }
+                }).catch(e => console.warn('loadMaaTimers error:', e));
+        }
+
+        function renderMaaTimersList(list, windowMinutes) {
+            const container = document.getElementById('maaTimersList');
+            if (!container) return;
+            if (!list || list.length === 0) {
+                container.innerHTML = '<div style="color:var(--claude-text-dim);padding:8px;font-size:12px;text-align:center;">暂未启用任何定时班次</div>';
+                return;
+            }
+
+            let html = '';
+            list.forEach((t, idx) => {
+                const h = String(t.Hour || 0).padStart(2, '0');
+                const m = String(t.Minute || 0).padStart(2, '0');
+                const timeStr = `${h}:${m}`;
+                const endTotal = (parseInt(h) * 60 + parseInt(m) + windowMinutes) % 1440;
+                const endStr = `${String(Math.floor(endTotal / 60)).padStart(2, '0')}:${String(endTotal % 60).padStart(2, '0')}`;
+                const isEn = Boolean(t.IsEnabled);
+
+                html += `
+                <div class="timer-row" id="timer-row-${idx}">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <input type="checkbox" class="maa-task-toggle" ${isEn ? 'checked' : ''} onchange="updateMaaTimerField(${idx}, 'IsEnabled', this.checked)" title="开关此班次" />
+                        <input type="time" class="form-input" style="width:110px;text-align:center;font-size:14px;font-weight:bold;margin-bottom:0;" value="${timeStr}" onchange="updateMaaTimerTime(${idx}, this.value)" />
+                        <span class="slot-pill" style="font-size:11px;font-weight:bold;">${timeStr} ~ ${endStr} (${windowMinutes}分独占)</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <select style="font-size:11px;padding:2px 6px;margin-bottom:0;" onchange="updateMaaTimerField(${idx}, 'Config', this.value)">
+                            <option value="Default" ${t.Config === 'Default' ? 'selected' : ''}>Default 配置</option>
+                        </select>
+                        <button type="button" class="btn-action" style="color:var(--claude-danger);padding:2px 8px;font-size:12px;" onclick="deleteMaaTimerRow(${idx})" title="删除此班次">🗑️</button>
+                    </div>
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+
+        function updateMaaTimerField(idx, field, val) {
+            if (CURRENT_MAA_TIMERS && CURRENT_MAA_TIMERS.List && CURRENT_MAA_TIMERS.List[idx]) {
+                CURRENT_MAA_TIMERS.List[idx][field] = val;
+                rerenderMaaTimers();
+            }
+        }
+
+        function updateMaaTimerTime(idx, timeVal) {
+            if (!timeVal || !CURRENT_MAA_TIMERS || !CURRENT_MAA_TIMERS.List || !CURRENT_MAA_TIMERS.List[idx]) return;
+            const parts = timeVal.split(':');
+            CURRENT_MAA_TIMERS.List[idx].Hour = parseInt(parts[0]) || 0;
+            CURRENT_MAA_TIMERS.List[idx].Minute = parseInt(parts[1]) || 0;
+            rerenderMaaTimers();
+        }
+
+        function rerenderMaaTimers() {
+            if (!CURRENT_MAA_TIMERS) return;
+            renderMaaTimersList(CURRENT_MAA_TIMERS.List || [], CURRENT_MAA_TIMERS.WindowMinutes || 40);
+            renderMaaTimelineGantt(buildLocalSlots(), CURRENT_MAA_TIMERS.WindowMinutes || 40);
+        }
+
+        function buildLocalSlots() {
+            const slots = [];
+            // 保留其他账号的已占用时段
+            (CURRENT_MAA_ALL_SLOTS || []).forEach(s => {
+                if (!s.is_current) slots.push(s);
+            });
+            if (!CURRENT_MAA_TIMERS || !CURRENT_MAA_TIMERS.List) return slots;
+            // 叠加当前账号本地编辑中的班次
+            CURRENT_MAA_TIMERS.List.forEach(t => {
+                if (t.IsEnabled) {
+                    slots.push({
+                        hour: parseInt(t.Hour) || 0,
+                        minute: parseInt(t.Minute) || 0,
+                        window_minutes: CURRENT_MAA_TIMERS.WindowMinutes || 40,
+                        is_current: true,
+                        account_name: '当前账号'
+                    });
+                }
+            });
+            return slots;
+        }
+
+        function addNewMaaTimerRow() {
+            if (!CURRENT_MAA_TIMERS) CURRENT_MAA_TIMERS = { List: [], WindowMinutes: 40 };
+            if (!CURRENT_MAA_TIMERS.List) CURRENT_MAA_TIMERS.List = [];
+            // 选取一个当前未被占用的候选时间，避免新班次默认互相冲突
+            const used = new Set(CURRENT_MAA_TIMERS.List.map(t => (((parseInt(t.Hour) || 0) * 60) + (parseInt(t.Minute) || 0))));
+            const candidates = [8, 10, 12, 14, 16, 18, 20, 22, 6, 0, 9, 11, 13, 15, 17, 19, 21, 23];
+            let hour = 10, minute = 0;
+            for (const h of candidates) {
+                if (!used.has(h * 60)) { hour = h; minute = 0; break; }
+            }
+            const nextId = CURRENT_MAA_TIMERS.List.reduce((mx, t) => Math.max(mx, parseInt(t.Id) || 0), -1) + 1;
+            CURRENT_MAA_TIMERS.List.push({
+                Id: nextId,
+                IsEnabled: true,
+                Config: 'Default',
+                Hour: hour,
+                Minute: minute,
+                Remark: '新班次'
+            });
+            rerenderMaaTimers();
+        }
+
+        function deleteMaaTimerRow(idx) {
+            if (!CURRENT_MAA_TIMERS || !CURRENT_MAA_TIMERS.List) return;
+            CURRENT_MAA_TIMERS.List.splice(idx, 1);
+            rerenderMaaTimers();
+        }
+
+        function saveMaaTimersForCurrentAccount() {
+            const acc = getCurrentAccount();
+            if (!acc || !acc.id || !CURRENT_MAA_TIMERS) return;
+            const alertBox = document.getElementById('maaTimerConflictAlert');
+            if (alertBox) alertBox.style.display = 'none';
+
+            fetch('/api/maa/timers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ account_id: acc.id, timers: CURRENT_MAA_TIMERS, window_minutes: 40 })
+            }).then(r => r.json().then(data => ({ status: r.status, data }))).then(({ status, data }) => {
+                if (status === 200 && data.success) {
+                    alert('✔ 定时执行配置已成功保存并同步系统调度！');
+                    loadMaaTimersForCurrentAccount();
+                } else if (status === 409 || data.error === 'conflict') {
+                    if (alertBox) {
+                        alertBox.style.display = 'block';
+                        alertBox.innerHTML = `⚠️ <b>${escapeHtml(data.message || '时段冲突禁止保存')}</b>`;
+                    }
+                    alert(data.message || '时段冲突禁止保存，请错开时段！');
+                } else {
+                    alert('保存异常: ' + (data.message || data.error || '未知错误'));
+                }
+            }).catch(e => alert('网络异常: ' + e));
+        }
+
+        function renderMaaTimelineGantt(allSlots, windowMinutes) {
+            const blocksEl = document.getElementById('maa-timeline-blocks');
+            if (!blocksEl) return;
+            blocksEl.innerHTML = '';
+
+            allSlots.forEach(s => {
+                const startM = (s.hour * 60 + s.minute) % 1440;
+                const dur = s.window_minutes || windowMinutes || 40;
+                const leftPct = (startM / 1440) * 100;
+                const widthPct = (dur / 1440) * 100;
+                const bg = s.is_current ? 'var(--claude-clay)' : '#64748b';
+
+                const block = document.createElement('div');
+                block.style.position = 'absolute';
+                block.style.top = '2px';
+                block.style.bottom = '2px';
+                block.style.left = leftPct + '%';
+                block.style.width = Math.max(0.6, widthPct) + '%';
+                block.style.background = bg;
+                block.style.borderRadius = '3px';
+                block.style.opacity = '0.9';
+                block.title = `${s.account_name} (${String(s.hour).padStart(2,'0')}:${String(s.minute).padStart(2,'0')} ~ ${dur}分钟)`;
+                blocksEl.appendChild(block);
+            });
+        }
+
+        // --- Copilot 自动战斗逻辑 (1:1 复刻 MAA 桌面版) ---
+        let CURRENT_COPILOT_JOBS = [];   // [{filename,title,details,is_raid,checked}]
+
+        function onCopilotFormChange(on) {
+            const deps = document.getElementById('copilotFormDeps');
+            if (deps) deps.style.display = on ? 'block' : 'none';
+        }
+        function onCopilotUseListChange(on) {
+            const listDeps = document.getElementById('copilotListDeps');
+            const loopDeps = document.getElementById('copilotLoopDeps');
+            if (listDeps) listDeps.style.display = on ? 'block' : 'none';
+            if (loopDeps) loopDeps.style.display = on ? 'none' : 'block';
+        }
+        function toggleCopilotUseFormation(on) {
+            const row = document.getElementById('rowCopilotFormationIndex');
+            if (row) row.style.display = on ? 'flex' : 'none';
+        }
+        function toggleCopilotSupport(on) {
+            const row = document.getElementById('rowCopilotSupport');
+            if (row) row.style.display = on ? 'flex' : 'none';
+        }
+        function toggleCopilotUserAdditional(on) {
+            const box = document.getElementById('copilotUserAdditionalBox');
+            if (box) box.style.display = on ? 'block' : 'none';
+        }
+
+        function renderCopilotFormFromConfig(cop) {
+            cop = cop || {};
+            const setChecked = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+            setChecked('copilotForm', cop.Form !== false);
+            setChecked('copilotUseList', !!cop.UseCopilotList);
+            setChecked('copilotUseFormation', !!cop.UseFormation);
+            const fi = document.getElementById('copilotFormationIndex');
+            if (fi) fi.value = String(cop.SelectFormation || 1);
+            const suppEl = document.getElementById('copilotSupport');
+            if (suppEl) suppEl.value = String(cop.SupportUnitUsage === 3 ? 3 : 1);
+            setChecked('copilotUseSupport', !!cop.UseSupportUnitUsage);
+            setChecked('copilotIgnoreReq', !!cop.IgnoreRequirements);
+            setChecked('copilotAddTrust', !!cop.AddTrust);
+            setChecked('copilotAddUserAdditional', !!cop.AddUserAdditional);
+            const loopEl = document.getElementById('copilotLoopTimes');
+            if (loopEl) loopEl.value = cop.LoopTimes || 1;
+            setChecked('copilotSanityPotion', !!cop.UseSanityPotion);
+            CURRENT_COPILOT_USER_ADDITIONAL = Array.isArray(cop.UserAdditional) ? cop.UserAdditional : [];
+            renderCopilotUserAdditional();
+            // 联动
+            onCopilotFormChange(cop.Form !== false);
+            onCopilotUseListChange(!!cop.UseCopilotList);
+            toggleCopilotUseFormation(!!cop.UseFormation);
+            toggleCopilotSupport(!!cop.UseSupportUnitUsage);
+            toggleCopilotUserAdditional(!!cop.AddUserAdditional);
+        }
+
+        function renderCopilotUserAdditional() {
+            const container = document.getElementById('copilotUserAdditionalList');
+            if (!container) return;
+            if (!CURRENT_COPILOT_USER_ADDITIONAL || CURRENT_COPILOT_USER_ADDITIONAL.length === 0) {
+                container.innerHTML = '<span style="font-size:10px;color:var(--claude-text-dim);">未追加自定干员</span>';
+                return;
+            }
+            let html = '';
+            CURRENT_COPILOT_USER_ADDITIONAL.forEach((op, idx) => {
+                html += `
+                <div style="display:flex;gap:6px;align-items:center;background:var(--claude-surface-inset);padding:4px 8px;border-radius:4px;">
+                    <input type="text" class="form-input" style="flex:1;font-size:11px;margin-bottom:0;" placeholder="干员中文名 (例如 史尔特尔)" value="${escapeHtml(op.Name||'')}" onchange="CURRENT_COPILOT_USER_ADDITIONAL[${idx}].Name = this.value" />
+                    <select style="font-size:11px;padding:2px 4px;margin-bottom:0;" onchange="CURRENT_COPILOT_USER_ADDITIONAL[${idx}].Skill = parseInt(this.value)">
+                        <option value="1" ${op.Skill === 1 ? 'selected' : ''}>一技能</option>
+                        <option value="2" ${op.Skill === 2 ? 'selected' : ''}>二技能</option>
+                        <option value="3" ${op.Skill === 3 ? 'selected' : ''}>三技能</option>
+                    </select>
+                    <button type="button" class="btn-action" style="color:var(--claude-danger);padding:2px 6px;font-size:10px;" onclick="removeCopilotOperatorRow(${idx})">✕</button>
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+        function addCopilotOperatorRow() {
+            if (!CURRENT_COPILOT_USER_ADDITIONAL) CURRENT_COPILOT_USER_ADDITIONAL = [];
+            CURRENT_COPILOT_USER_ADDITIONAL.push({ Name: "", Skill: 1 });
+            renderCopilotUserAdditional();
+        }
+        function removeCopilotOperatorRow(idx) {
+            if (!CURRENT_COPILOT_USER_ADDITIONAL) return;
+            CURRENT_COPILOT_USER_ADDITIONAL.splice(idx, 1);
+            renderCopilotUserAdditional();
+        }
+
+        function loadCopilotJobList() {
+            return fetch('/api/maa/copilot/list')
+                .then(r => r.json())
+                .then(res => {
+                    if (res.success && res.categories) {
+                        const flat = [];
+                        res.categories.forEach(cat => (cat.items || []).forEach(it => {
+                            const exist = CURRENT_COPILOT_JOBS.find(j => j.filename === it.filename);
+                            flat.push({
+                                filename: it.filename,
+                                title: it.title || it.filename,
+                                details: it.details || '',
+                                is_raid: exist ? !!exist.is_raid : false,
+                                checked: exist ? !!exist.checked : true
+                            });
+                        }));
+                        CURRENT_COPILOT_JOBS = flat;
+                        renderCopilotJobList();
+                    }
+                    return res;
+                }).catch(e => { console.warn('loadCopilot error:', e); return { success: false }; });
+        }
+
+        function renderCopilotJobList() {
+            const box = document.getElementById('copilotJobListBox');
+            const list = document.getElementById('copilotJobList');
+            if (!box || !list) return;
+            if (!CURRENT_COPILOT_JOBS.length) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            let html = '';
+            CURRENT_COPILOT_JOBS.forEach((j, idx) => {
+                html += `
+                <div style="display:flex;gap:6px;align-items:center;background:var(--claude-surface-inset);padding:5px 8px;border-radius:5px;border:1px solid var(--claude-border-subtle);">
+                    <input type="checkbox" ${j.checked ? 'checked' : ''} onchange="CURRENT_COPILOT_JOBS[${idx}].checked = this.checked" />
+                    <span style="flex:1;font-size:11px;color:var(--claude-text-main);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(j.details)}">${escapeHtml(j.title)}</span>
+                    <label style="font-size:10px;color:var(--claude-text-muted);display:flex;align-items:center;gap:3px;cursor:pointer;"><input type="checkbox" ${j.is_raid ? 'checked' : ''} onchange="CURRENT_COPILOT_JOBS[${idx}].is_raid = this.checked" />突袭</label>
+                    <button type="button" class="btn-action" style="padding:2px 6px;font-size:10px;color:var(--claude-danger);" onclick="removeCopilotJob(${idx})">✕</button>
+                </div>`;
+            });
+            list.innerHTML = html;
+        }
+        function removeCopilotJob(idx) {
+            CURRENT_COPILOT_JOBS.splice(idx, 1);
+            renderCopilotJobList();
+        }
+        function clearCopilotJobs() {
+            if (!confirm('确定清空当前作业列表吗？(服务端文件不受影响，可重新拉取)')) return;
+            CURRENT_COPILOT_JOBS = [];
+            renderCopilotJobList();
+        }
+
+        function triggerCopilotUpload() {
+            const fi = document.getElementById('fileUploadCopilot');
+            if (fi) fi.click();
+        }
+        function handleCopilotUpload(e) {
+            const files = Array.from(e.target.files || []);
+            if (!files.length) return;
+            let pending = files.length;
+            files.forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    try {
+                        const content = JSON.parse(evt.target.result);
+                        fetch('/api/maa/copilot/upload', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ filename: file.name, content: content })
+                        }).then(r => r.json()).then(res => {
+                            if (!res.success) alert('上传失败 [' + file.name + ']: ' + res.error);
+                            if (--pending === 0) {
+                                alert('✔ 作业导入完成 (使用即生效，不落库)');
+                                loadCopilotJobList();
+                            }
+                        }).catch(err => { alert('网络异常: ' + err); if (--pending === 0) loadCopilotJobList(); });
+                    } catch(err) {
+                        alert('作业 JSON 解析失败 [' + file.name + ']: ' + err);
+                        if (--pending === 0) loadCopilotJobList();
+                    }
+                };
+                reader.readAsText(file);
+            });
+            e.target.value = '';
+        }
+
+        function fetchCopilotByCode(btnEl) {
+            const input = document.getElementById('copilotMysteryCode');
+            const code = (input ? input.value : '').trim();
+            if (!code) { alert('请输入作业站神秘代码 (纯数字 ID)'); return; }
+            if (!/^\\d+$/.test(code)) { alert('神秘代码必须为纯数字 ID'); return; }
+            const btn = btnEl || null;
+            if (btn) btn.disabled = true;
+            fetch('/api/maa/copilot/fetch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code: code })
+            }).then(r => r.json()).then(res => {
+                if (btn) btn.disabled = false;
+                if (res.success) {
+                    alert(`✔ 神秘代码 [${code}] 作业已导入：${res.title || res.filename}`);
+                    if (input) input.value = '';
+                    loadCopilotJobList();
+                } else {
+                    alert('拉取失败: ' + (res.error || res.message || '未知错误'));
+                }
+            }).catch(e => { if (btn) btn.disabled = false; alert('网络异常: ' + e); });
+        }
+
+        function triggerMaaQueueRun() {
+            const acc = getCurrentAccount();
+            if (!acc || !acc.id) { alert('请先选择托管账号'); return; }
+            fetch('/api/maa/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ account_id: acc.id, mode: 'queue' })
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    alert('✔ 一键长草任务已启动！可在左侧观察画面或在日志查看进度。');
+                } else {
+                    alert('启动失败: ' + (res.message || res.error));
+                }
+            }).catch(e => alert('启动异常: ' + e));
+        }
+
+        function triggerMaaCopilotRun() {
+            const acc = getCurrentAccount();
+            if (!acc || !acc.id) { alert('请先选择托管账号'); return; }
+
+            const formOn = Boolean((document.getElementById('copilotForm') || {}).checked);
+            const useList = Boolean((document.getElementById('copilotUseList') || {}).checked);
+            const useFormation = Boolean((document.getElementById('copilotUseFormation') || {}).checked);
+            const formationIndex = parseInt((document.getElementById('copilotFormationIndex') || {}).value || 1);
+            const useSupport = Boolean((document.getElementById('copilotUseSupport') || {}).checked);
+            const supportUsage = parseInt((document.getElementById('copilotSupport') || {}).value || 1);
+            const addTrust = Boolean((document.getElementById('copilotAddTrust') || {}).checked);
+            const addUser = Boolean((document.getElementById('copilotAddUserAdditional') || {}).checked);
+            const ignoreReq = Boolean((document.getElementById('copilotIgnoreReq') || {}).checked);
+            const loopTimes = parseInt((document.getElementById('copilotLoopTimes') || {}).value || 1);
+            const usePot = Boolean((document.getElementById('copilotSanityPotion') || {}).checked);
+
+            const checked = (CURRENT_COPILOT_JOBS || []).filter(j => j.checked);
+            if (!checked.length) { alert('请先上传本地 JSON 或通过神秘代码导入作业，并至少勾选一个'); return; }
+
+            let payload = {
+                account_id: acc.id,
+                mode: 'copilot',
+                formation: formOn,
+                use_copilot_list: useList,
+                formation_index: useFormation ? formationIndex : 0,
+                support_unit_usage: useSupport ? supportUsage : 0,
+                add_trust: addTrust,
+                ignore_requirements: ignoreReq,
+                user_additional: addUser ? CURRENT_COPILOT_USER_ADDITIONAL : []
+            };
+            if (useList) {
+                payload.copilot_list = checked.map(j => ({ filename: j.filename, stage_name: "", is_raid: !!j.is_raid }));
+                payload.use_sanity_potion = usePot;
+            } else {
+                payload.copilot_file = checked[0].filename;
+                payload.loop_times = loopTimes;
+            }
+
+            fetch('/api/maa/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }).then(r => r.json()).then(res => {
+                if (res.success) {
+                    alert(`✔ Copilot 自动战斗已成功调度 (${useList ? checked.length + ' 个作业' : checked[0].title})`);
+                } else {
+                    alert('启动失败: ' + (res.message || res.error));
+                }
+            }).catch(e => alert('启动异常: ' + e));
         }
 
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
-                // 用户没看这个界面了就直接关停轮询，零后台消耗
                 stopScreenPolling();
+                stopStreamPlayer();
             } else {
-                if (isScreenPollingActive) {
+                if (screenMode === '0.2fps' && isScreenTabActive()) {
                     refreshScreen(true);
                     startScreenPolling();
+                } else if (screenMode === '30fps' && isScreenTabActive()) {
+                    initStreamPlayer();
                 }
             }
         });
-
-        function getCoords(e) {
-            const rect = img.getBoundingClientRect();
-            const clientX = e.clientX || (e.touches && e.touches[0].clientX);
-            const clientY = e.clientY || (e.touches && e.touches[0].clientY);
-            const x = Math.round((clientX - rect.left) / rect.width * 1280);
-            const y = Math.round((clientY - rect.top) / rect.height * 720);
-            return { x: Math.max(0, Math.min(1280, x)), y: Math.max(0, Math.min(720, y)) };
-        }
 
             </script>
 </body>
 </html>
 """
 
+
+
+
+
+# ==================== 30FPS H.264 硬件直通流媒体服务 ====================
+# ==================== 30FPS H.264 硬件直通流媒体服务 (极速直传) ====================
+class H264StreamServer:
+    def __init__(self):
+        self.clients = {}  # sock -> (username, role)
+        self.lock = threading.Lock()
+        self.proc = None
+        self.running = False
+        self.cached_sps = None
+        self.cached_pps = None
+        self.cached_idr = None
+        self.thread = None
+
+    def add_client(self, sock, username="admin", role="admin"):
+        with self.lock:
+            self.clients[sock] = (username, role)
+            if self.cached_sps and self.cached_pps and self.cached_idr:
+                try:
+                    self._send_frame(sock, self.cached_sps)
+                    self._send_frame(sock, self.cached_pps)
+                    self._send_frame(sock, self.cached_idr)
+                except Exception:
+                    pass
+            if not self.running:
+                self.running = True
+                self.thread = threading.Thread(target=self._worker, daemon=True)
+                self.thread.start()
+
+    def remove_client(self, sock):
+        with self.lock:
+            self.clients.pop(sock, None)
+            if not self.clients:
+                self.running = False
+                if self.proc:
+                    try:
+                        self.proc.terminate()
+                    except Exception:
+                        pass
+                    self.proc = None
+
+    def _send_frame(self, sock, data):
+        length = len(data)
+        hdr = bytearray([0x82])
+        if length < 126:
+            hdr.append(length)
+        elif length < 65536:
+            hdr.extend([126, (length >> 8) & 0xff, length & 0xff])
+        else:
+            hdr.extend([127] + list(length.to_bytes(8, "big")))
+        sock.sendall(hdr + data)
+
+    def _broadcast(self, data):
+        dead = []
+        running_info = get_running_task_info()
+        active_acc_owner = None
+        if not running_info:
+            try:
+                acc = db.get_account(db.get_active_account_id())
+                if acc:
+                    active_acc_owner = acc.get("owner_username")
+            except Exception:
+                pass
+
+        with self.lock:
+            for s, (uname, role) in list(self.clients.items()):
+                can_see = False
+                if role == "admin":
+                    can_see = True
+                elif running_info:
+                    if running_info.get("owner_username") == uname:
+                        can_see = True
+                else:
+                    if active_acc_owner == uname:
+                        can_see = True
+
+                if not can_see:
+                    continue
+
+                try:
+                    self._send_frame(s, data)
+                except Exception:
+                    dead.append(s)
+            for d in dead:
+                self.clients.pop(d, None)
+
+    def _worker(self):
+        print("[H264Stream] 启动 1280x720@30fps 硬件直通流媒体采集...", flush=True)
+        while self.running:
+            with self.lock:
+                if not self.clients:
+                    break
+            if not is_emulator_alive():
+                time.sleep(1)
+                continue
+            cmd = [ADB, "-s", DEVICE, "shell", "screenrecord", "--output-format=h264", "--size", "1280x720", "--bit-rate", "4000000", "--time-limit", "180", "-"]
+            proc = None
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                with self.lock:
+                    self.proc = proc
+                buf = bytearray()
+                while self.running and proc.poll() is None:
+                    with self.lock:
+                        if not self.clients:
+                            break
+                    if not proc.stdout:
+                        break
+                    r, _, _ = select.select([proc.stdout], [], [], 0.04)
+                    if r:
+                        chunk = os.read(proc.stdout.fileno(), 16384)
+                        if not chunk: break
+                        buf.extend(chunk)
+
+                    i = 0
+                    n = len(buf)
+                    starts = []
+                    while i < n - 3:
+                        if buf[i:i+3] == b"\x00\x00\x01":
+                            starts.append((i, 3))
+                            i += 3
+                        elif i < n - 4 and buf[i:i+4] == b"\x00\x00\x00\x01":
+                            starts.append((i, 4))
+                            i += 4
+                        else:
+                            i += 1
+
+                    nalus = []
+                    if len(starts) > 1:
+                        for idx in range(len(starts) - 1):
+                            p1, _ = starts[idx]
+                            p2, _ = starts[idx+1]
+                            nalus.append(bytes(buf[p1:p2]))
+                        last_p, _ = starts[-1]
+                        buf = buf[last_p:]
+                    elif not r and buf and starts:
+                        nalus.append(bytes(buf))
+                        buf = bytearray()
+
+                    for nalu in nalus:
+                        slen = 4 if nalu.startswith(b"\x00\x00\x00\x01") else 3
+                        ntype = nalu[slen] & 0x1f
+                        if ntype == 7:
+                            self.cached_sps = nalu
+                        elif ntype == 8:
+                            self.cached_pps = nalu
+                        elif ntype == 5:
+                            self.cached_idr = nalu
+                        self._broadcast(nalu)
+            except Exception as e:
+                print(f"[H264Stream] 异常: {e}", flush=True)
+            finally:
+                if proc:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                with self.lock:
+                    if self.proc is proc:
+                        self.proc = None
+            time.sleep(0.5)
+        print("[H264Stream] 客户端全部离开，硬件直通流媒体休眠待命 (零算力消耗)。", flush=True)
+
+STREAM_SERVER = H264StreamServer()
+
+def read_ws_message(sock):
+    try:
+        r, _, _ = select.select([sock], [], [], 0.5)
+        if not r:
+            return True
+        b = sock.recv(2)
+        if len(b) < 2: return None
+        b1, b2 = b[0], b[1]
+        opcode = b1 & 0x0f
+        if opcode == 0x08: return None
+        masked = bool(b2 & 0x80)
+        length = b2 & 0x7f
+        if length == 126:
+            ext = sock.recv(2)
+            if len(ext) < 2: return None
+            length = int.from_bytes(ext, "big")
+        elif length == 127:
+            ext = sock.recv(8)
+            if len(ext) < 8: return None
+            length = int.from_bytes(ext, "big")
+        mask = sock.recv(4) if masked else None
+        data = bytearray()
+        rem = length
+        while rem > 0:
+            c = sock.recv(min(rem, 65536))
+            if not c: return None
+            data.extend(c)
+            rem -= len(c)
+        if masked and mask:
+            for i in range(len(data)):
+                data[i] ^= mask[i % 4]
+        if opcode == 0x01:
+            try: return json.loads(data.decode("utf-8"))
+            except Exception: return None
+        elif opcode == 0x09:
+            sock.sendall(bytearray([0x8a, 0x00]))
+        return True
+    except Exception:
+        return None
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
@@ -3412,6 +5997,15 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def send_json(self, data, code=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(body)
 
     def get_current_user(self):
         # 1. 尝试从 Cookie 中解析
@@ -3584,9 +6178,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b'{"success": false, "error": "Forbidden: Not your account"}')
                     return
 
-                subprocess.run(["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(compose_cmd("up", "-d", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # 统一走 ark_service_ctl.sh，享受一致的“单班次 1 小时上限”与抢占保护
+                # 启动前清理孤儿残留，避免叠加触发 OOM 黑屏
+                try:
+                    reap_orphan_arknights_processes()
+                except Exception:
+                    pass
+                # 统一走 ark_service_ctl.sh (一致的排他锁与超时保护); 无 ctl 时退回直调 runner
                 ctl = BASE_DIR / "bin" / "ark_service_ctl.sh"
                 if ctl.exists():
                     subprocess.Popen(["bash", str(ctl), "run-daily", acc_id])
@@ -3628,27 +6227,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
 
+        elif path == "/api/emulator/start":
+            try:
+                cur_user = self.get_current_user()
+                if not cur_user:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                # 权限：管理员 或 拥有账号的属主均可开启
+                ok_perm = cur_user.get("role") == "admin"
+                if not ok_perm:
+                    owned = db.list_accounts(owner_username=cur_user.get("username"))
+                    ok_perm = bool(owned)
+                if not ok_perm:
+                    self.send_json({"success": False, "error": "Forbidden: 无可用托管账号，无法开启模拟器"}, code=403)
+                    return
+                # 任务执行中：模拟器由任务链自行管理，避免与启停时序竞争
+                if is_task_running():
+                    self.send_json({"success": True, "message": "已有托管任务在执行，模拟器由任务链自动管理，无需手动开启。"})
+                    return
+                ok, msg = start_emulator_blocking()
+                self.send_json({"success": ok, "message": msg})
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
         elif path == "/api/emulator/stop":
             try:
                 cur_user = self.get_current_user()
                 if not cur_user or cur_user.get("role") != "admin":
-                    self.send_response(403)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"success": false, "error": "Forbidden: Only admin can stop emulator"}')
+                    self.send_json({"success": False, "error": "Forbidden: Only admin can stop emulator"}, code=403)
                     return
-                subprocess.run([ADB, "-s", DEVICE, "shell", "am", "force-stop", "com.hypergryph.arknights"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["docker", "compose", "-f", str(COMPOSE_FILE), "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run([ADB, "disconnect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"success": true}')
+                if is_task_running():
+                    self.send_json({"success": False, "error": "托管任务正在执行中，请先「强制停止」任务后再停止模拟器。"}, code=409)
+                    return
+                ok, msg = stop_emulator_blocking()
+                self.send_json({"success": ok, "message": msg})
             except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
 
         elif path == "/api/accounts/switch":
             try:
@@ -3656,10 +6273,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = json.loads(post_data.decode("utf-8")) if post_data else {}
                 target_id = body.get("account_id")
                 acc = db.get_account(target_id)
-                if acc:
-                    if cur_user and (cur_user.get("role") == "admin" or acc.get("owner_username") == cur_user.get("username")):
-                        if cur_user.get("role") == "admin":
+                if acc and cur_user:
+                    is_admin = cur_user.get("role") == "admin"
+                    is_owner = acc.get("owner_username") == cur_user.get("username")
+                    if is_admin or is_owner:
+                        if is_admin:
+                            # 管理员：维护全局激活账号 (可跨用户代管)
                             db.set_active_account_id(target_id)
+                        else:
+                            # 普通用户：仅维护本人维度的激活账号，与他人完全隔离
+                            db.set_active_account_id(target_id, cur_user.get("username"))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -3750,26 +6373,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 updated_acc = body.get("account", body)
                 acc_id = updated_acc.get("id")
 
-                # 冲突检测: 提取此账号修改后的定时时间点 (间隔必须 >= 60 分钟)
-                prop_times = scheduler_guard.get_account_effective_times(updated_acc)
-                ok, conflict_msg, _ = scheduler_guard.check_schedule_conflicts(acc_id, prop_times)
-                if not ok:
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": False, "error": conflict_msg}).encode("utf-8"))
-                    return
-
-                data = load_accounts()
-                accs = data.get("accounts", [])
-                target_idx = next((i for i, a in enumerate(accs) if a.get("id") == acc_id), -1)
-                if target_idx == -1:
+                old_acc = db.get_account(acc_id)
+                if not old_acc:
                     self.send_response(404)
                     self.end_headers()
                     self.wfile.write(b'{"error": "Account not found"}')
                     return
 
-                old_acc = accs[target_idx]
                 # 越权安全校验：只有 admin 或本人可修改该账号
                 if cur_user.get("role") != "admin" and old_acc.get("owner_username") != cur_user.get("username"):
                     self.send_response(403)
@@ -3777,15 +6387,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b'{"error": "Forbidden: Not your account"}')
                     return
 
-                # 密码保存处理：若未修改密码(仍为掩码••••••••)，保留原存储密码
-                submitted_pwd = updated_acc.get("game_password", "")
-                if submitted_pwd == "••••••••":
-                    updated_acc["game_password"] = old_acc.get("game_password", "")
+                # 系统不再保存任何游戏账密：强制清空旧字段，避免历史残留
+                updated_acc.pop("game_password", None)
 
+                # 归属不可被篡改：强制沿用原所有者
                 updated_acc["owner_username"] = old_acc.get("owner_username", cur_user.get("username", DEFAULT_ADMIN_USER))
-                accs[target_idx] = updated_acc
-                data["accounts"] = accs
-                save_accounts(data)
+                # 保留运行期字段，避免被前端表单遗漏清空
+                for keep in ("schedules", "created_at"):
+                    if keep not in updated_acc and keep in old_acc:
+                        updated_acc[keep] = old_acc[keep]
+                db.save_account(updated_acc)
                 scheduler_guard.sync_all_system_crontabs()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3842,17 +6453,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 new_acc = body.get("account", {})
                 new_acc["owner_username"] = cur_user.get("username", DEFAULT_ADMIN_USER)
 
-                # 严格时段冲突排他校验 (任务时段间隔必须 >= 60 分钟)
                 acc_id = new_acc.get("id") or ("acc_" + str(int(time.time() * 1000)))
                 new_acc["id"] = acc_id
-                prop_times = scheduler_guard.get_account_effective_times(new_acc)
-                ok, conflict_msg, _ = scheduler_guard.check_schedule_conflicts(acc_id, prop_times)
-                if not ok:
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": False, "error": conflict_msg}).encode("utf-8"))
-                    return
 
                 db.save_account(new_acc)
                 scheduler_guard.sync_all_system_crontabs()
@@ -3876,21 +6478,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 body = json.loads(post_data.decode("utf-8")) if post_data else {}
                 filename = os.path.basename(body.get("filename", ""))
+                acc_id = body.get("account_id")
                 if not filename.endswith(".json"):
                     filename += ".json"
 
-                uname = cur_user.get("username", DEFAULT_ADMIN_USER)
-                u_dir = get_user_infrast_dir(uname)
-                target = u_dir / filename
-                if target.exists():
-                    target.unlink()
-                elif cur_user.get("role") == "admin":
-                    target_root = INFRAST_DIR / DEFAULT_ADMIN_USER / filename
-                    if target_root.exists():
-                        target_root.unlink()
-                    target_shared = INFRAST_DIR / filename
-                    if target_shared.exists():
-                        target_shared.unlink()
+                if acc_id:
+                    d = get_account_infrast_dir(acc_id)
+                    target = d / filename
+                    if target.exists():
+                        target.unlink()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3915,12 +6511,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 filename = os.path.basename(body.get("filename", ""))
                 content = body.get("content", {})
                 acc_id = body.get("account_id")
+                if not acc_id:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success": false, "error": "account_id required"}')
+                    return
                 if not filename.endswith(".json"):
                     filename += ".json"
 
-                uname = cur_user.get("username", DEFAULT_ADMIN_USER)
-                u_dir = get_user_infrast_dir(uname)
+                # 每账号仅保留一个基建文件：先清空该账号目录内所有旧文件
+                u_dir = get_account_infrast_dir(acc_id)
+                for old in u_dir.glob("*.json"):
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
                 target_path = u_dir / filename
+
                 with open(target_path, "w", encoding="utf-8") as out:
                     json.dump(content, out, ensure_ascii=False, indent=2)
 
@@ -3932,21 +6540,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         prop_times.append(periods[0][0])
 
                 conflict_warning = None
-                if prop_times and acc_id:
-                    ok_conf, c_msg, _ = scheduler_guard.check_schedule_conflicts(acc_id, prop_times)
-                    if not ok_conf:
-                        conflict_warning = c_msg
-
-                if acc_id:
-                    target_acc = db.get_account(acc_id)
-                    if target_acc:
-                        target_acc.setdefault("infrast", {})
-                        target_acc["infrast"]["mode"] = "custom_plan"
-                        target_acc["infrast"]["plan_file"] = filename
-                        if prop_times:
-                            target_acc["schedules"] = prop_times
-                        db.save_account(target_acc)
-                        scheduler_guard.sync_all_system_crontabs()
+                target_acc = db.get_account(acc_id)
+                if target_acc:
+                    target_acc.setdefault("infrast", {})
+                    target_acc["infrast"]["mode"] = "custom_plan"
+                    target_acc["infrast"]["plan_file"] = filename
+                    db.save_account(target_acc)
+                    # 同步写入该账号 MAA 配置队列中的基建任务 Filename
+                    try:
+                        cfg_rec = db.get_maa_config(acc_id)
+                        if cfg_rec and isinstance(cfg_rec.get("config"), dict):
+                            for t in cfg_rec["config"].get("TaskQueue", []):
+                                if t.get("$type") == "InfrastTask" and t.get("Mode") == "Custom":
+                                    t["Filename"] = filename
+                            db.save_maa_config(acc_id, target_acc.get("owner_username"), cfg_rec["config"], config_name=cfg_rec.get("config_name", "Default"))
+                    except Exception:
+                        pass
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3965,6 +6574,254 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
             return
 
+        elif path == "/api/maa/config":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            try:
+                body = json.loads(post_data.decode("utf-8")) if post_data else {}
+                acc_id = resolve_active_account_for_user(cur_user, body.get("account_id"))
+                target_acc = db.get_account(acc_id)
+                if not target_acc:
+                    self.send_json({"success": False, "error": "Account not found"}, code=404)
+                    return
+                if cur_user.get("role") != "admin" and target_acc.get("owner_username") != cur_user.get("username"):
+                    self.send_json({"success": False, "error": "Forbidden: Not your account"}, code=403)
+                    return
+
+                new_cfg = body.get("config", {})
+                cfg_name = body.get("config_name", "Default")
+                if not isinstance(new_cfg, dict):
+                    self.send_json({"success": False, "error": "Invalid config format"}, code=400)
+                    return
+
+                # 服务端权威校验：理智作战关卡名合法性
+                ok_stage, stage_err = maa_config_adapter.validate_stage_plan(new_cfg)
+                if not ok_stage:
+                    self.send_json({"success": False, "error": "invalid_stage", "message": stage_err}, code=400)
+                    return
+
+                db.save_maa_config(acc_id, target_acc.get("owner_username"), new_cfg, config_name=cfg_name)
+                self.send_json({"success": True, "message": "MAA 桌面版配置已更新", "account_id": acc_id})
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
+        elif path == "/api/maa/timers":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            try:
+                body = json.loads(post_data.decode("utf-8")) if post_data else {}
+                acc_id = resolve_active_account_for_user(cur_user, body.get("account_id"))
+                target_acc = db.get_account(acc_id)
+                if not target_acc:
+                    self.send_json({"success": False, "error": "Account not found"}, code=404)
+                    return
+                if cur_user.get("role") != "admin" and target_acc.get("owner_username") != cur_user.get("username"):
+                    self.send_json({"success": False, "error": "Forbidden: Not your account"}, code=403)
+                    return
+
+                new_timers = body.get("timers", {})
+                window_min = int(body.get("window_minutes") or 40)
+                if not isinstance(new_timers, dict):
+                    self.send_json({"success": False, "error": "Invalid timers format"}, code=400)
+                    return
+
+                # 时段独占碰撞校验 (核心报错拦截：冲突禁止保存)
+                all_existing = db.list_all_maa_timers()
+                acc_names = {a["id"]: a["name"] for a in db.list_accounts()}
+                is_valid, err_msg = maa_config_adapter.check_timers_conflict(
+                    acc_id, new_timers, all_existing, window_minutes=window_min, acc_names_map=acc_names
+                )
+                if not is_valid:
+                    self.send_json({
+                        "success": False,
+                        "error": "conflict",
+                        "message": err_msg
+                    }, code=409)
+                    return
+
+                db.save_maa_timers(acc_id, target_acc.get("owner_username"), new_timers, window_minutes=window_min)
+
+                # 同步回写 account.schedules 以便 crontab 调度
+                active_slots = []
+                for t in new_timers.get("List", []):
+                    if t.get("IsEnabled"):
+                        h = int(t.get("Hour", 0))
+                        m = int(t.get("Minute", 0))
+                        active_slots.append(f"{h:02d}:{m:02d}")
+                target_acc["schedules"] = active_slots
+                db.save_account(target_acc)
+                scheduler_guard.sync_all_system_crontabs()
+
+                self.send_json({
+                    "success": True,
+                    "message": "定时执行配置已保存并同步至系统调度器",
+                    "account_id": acc_id,
+                    "active_slots": active_slots
+                })
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
+        elif path == "/api/maa/copilot/upload":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            try:
+                body = json.loads(post_data.decode("utf-8")) if post_data else {}
+                fname = os.path.basename(body.get("filename", "").strip())
+                if not fname:
+                    self.send_json({"success": False, "error": "Filename is required"}, code=400)
+                    return
+                if not fname.endswith(".json"):
+                    fname += ".json"
+
+                content = body.get("content")
+                if isinstance(content, str):
+                    try:
+                        content = json.loads(content)
+                    except Exception:
+                        self.send_json({"success": False, "error": "Invalid JSON content"}, code=400)
+                        return
+
+                uname = cur_user.get("username", DEFAULT_ADMIN_USER)
+                u_dir = BASE_DIR / "data" / "copilot_uploads" / uname
+                u_dir.mkdir(parents=True, exist_ok=True)
+                target_file = u_dir / fname
+                with open(target_file, "w", encoding="utf-8") as f:
+                    json.dump(content, f, ensure_ascii=False, indent=2)
+
+                self.send_json({"success": True, "filename": fname, "message": "作业上传成功"})
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
+        elif path == "/api/maa/copilot/fetch":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            try:
+                body = json.loads(post_data.decode("utf-8")) if post_data else {}
+                code_val = str(body.get("code", "")).strip()
+                if not code_val.isdigit():
+                    self.send_json({"success": False, "error": "神秘代码必须为纯数字作业 ID"}, code=400)
+                    return
+                api_url = f"https://prts.maa.plus/copilot/get/{code_val}"
+                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (MAA-Web-Client)"})
+                payload = None
+                last_err = None
+                for _attempt in range(3):
+                    try:
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            payload = json.loads(resp.read().decode("utf-8"))
+                        break
+                    except Exception as net_err:
+                        last_err = net_err
+                        time.sleep(1.5)
+                if payload is None:
+                    self.send_json({"success": False, "error": f"作业站访问失败(已重试3次): {last_err}"}, code=502)
+                    return
+
+                if int(payload.get("status_code", 0)) != 200 or not payload.get("data"):
+                    self.send_json({"success": False, "error": payload.get("message") or "神秘代码无效或作业不存在"}, code=404)
+                    return
+
+                data = payload["data"]
+                content = data.get("content")
+                if isinstance(content, str):
+                    try:
+                        content = json.loads(content)
+                    except Exception:
+                        self.send_json({"success": False, "error": "作业内容解析失败"}, code=502)
+                        return
+                if not isinstance(content, dict):
+                    self.send_json({"success": False, "error": "作业内容为空"}, code=502)
+                    return
+
+                stage_name = str(content.get("stage_name", "")).strip() or f"copilot_{code_val}"
+                safe_stage = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", stage_name)[:40]
+                fname = f"code{code_val}_{safe_stage}.json"
+
+                uname = cur_user.get("username", DEFAULT_ADMIN_USER)
+                u_dir = BASE_DIR / "data" / "copilot_uploads" / uname
+                u_dir.mkdir(parents=True, exist_ok=True)
+                with open(u_dir / fname, "w", encoding="utf-8") as f:
+                    json.dump(content, f, ensure_ascii=False, indent=2)
+
+                doc = content.get("doc", {}) if isinstance(content.get("doc"), dict) else {}
+                self.send_json({
+                    "success": True,
+                    "filename": fname,
+                    "title": doc.get("title") or stage_name,
+                    "details": doc.get("details", ""),
+                    "message": f"神秘代码 {code_val} 作业已拉取就绪"
+                })
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
+        elif path == "/api/maa/run":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            if is_task_running():
+                self.send_json({"success": False, "error": "已有任务正在执行中，请稍候"}, code=409)
+                return
+            try:
+                body = json.loads(post_data.decode("utf-8")) if post_data else {}
+                acc_id = resolve_active_account_for_user(cur_user, body.get("account_id"))
+                target_acc = db.get_account(acc_id)
+                if not target_acc:
+                    self.send_json({"success": False, "error": "Account not found"}, code=404)
+                    return
+                if cur_user.get("role") != "admin" and target_acc.get("owner_username") != cur_user.get("username"):
+                    self.send_json({"success": False, "error": "Forbidden: Not your account"}, code=403)
+                    return
+
+                mode = body.get("mode", "queue")
+                subprocess.run(compose_cmd("up", "-d", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 启动前清理孤儿残留，避免叠加触发 OOM 黑屏
+                try:
+                    reap_orphan_arknights_processes()
+                except Exception:
+                    pass
+
+                if mode == "copilot":
+                    extra_data = {
+                        "copilot_file": body.get("copilot_file", ""),
+                        "copilot_list": body.get("copilot_list", []) or [],
+                        "use_copilot_list": bool(body.get("use_copilot_list", False)),
+                        "formation": bool(body.get("formation", True)),
+                        "formation_index": int(body.get("formation_index", 0) or 0),
+                        "support_unit_usage": int(body.get("support_unit_usage", 0)),
+                        "add_trust": bool(body.get("add_trust", False)),
+                        "ignore_requirements": bool(body.get("ignore_requirements", False)),
+                        "user_additional": body.get("user_additional", []),
+                        "loop_times": body.get("loop_times", 1),
+                        "use_sanity_potion": bool(body.get("use_sanity_potion", False))
+                    }
+                    extra_json = json.dumps(extra_data, ensure_ascii=False)
+                    subprocess.Popen(["python3", str(RUNNER_SCRIPT), "copilot", acc_id, extra_json])
+                else:
+                    ctl = BASE_DIR / "bin" / "ark_service_ctl.sh"
+                    if ctl.exists():
+                        subprocess.Popen(["bash", str(ctl), "run-daily", acc_id])
+                    else:
+                        subprocess.Popen(["python3", str(RUNNER_SCRIPT), "daily", acc_id])
+
+                self.send_json({"success": True, "message": f"任务已成功调度启动 ({mode})"})
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -3973,6 +6830,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        if self.headers.get("Upgrade", "").lower() == "websocket" or path.startswith("/ws/"):
+            cur_user = self.get_current_user()
+            if not cur_user:
+                token_param = params.get("token", [""])[0]
+                if token_param:
+                    cur_user = verify_session_token(token_param)
+            if not cur_user:
+                self.send_response(401)
+                self.end_headers()
+                return
+
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key:
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            accept_val = base64.b64encode(hashlib.sha1(key.encode() + magic).digest()).decode()
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept_val)
+            self.end_headers()
+
+            sock = self.request
+            sock.setblocking(True)
+            STREAM_SERVER.add_client(sock, cur_user.get("username", "admin"), cur_user.get("role", "user"))
+            try:
+                while True:
+                    m = read_ws_message(sock)
+                    if m is None:
+                        break
+                    # 仅显示模式：忽略任何客户端误发或恶意伪造的触控点击事件，防止误触
+                    if isinstance(m, dict):
+                        pass
+            except Exception:
+                pass
+            finally:
+                STREAM_SERVER.remove_client(sock)
+            return
+
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/jmuxer.min.js":
+            jm_file = os.path.join(BASE_DIR, "jmuxer.min.js")
+            if os.path.exists(jm_file):
+                with open(jm_file, "rb") as f:
+                    c = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript")
+                self.send_header("Content-Length", str(len(c)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(c)
+                return
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
 
         if path == "/" or path == "/index.html":
             if not self.check_cookie_auth():
@@ -3997,7 +6917,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if url_tok and verify_session_token(url_tok):
                     self.send_header("Set-Cookie", f"ark_session={url_tok}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax")
 
-                page_html = APP_PAGE
+                cur_token = ""
+                cookies = self.headers.get("Cookie", "")
+                for c in cookies.split(";"):
+                    if "ark_session=" in c:
+                        cur_token = c.split("ark_session=")[1].strip().strip('"\'')
+                        break
+                if not cur_token and url_tok:
+                    cur_token = url_tok
+
+                page_html = APP_PAGE.replace('let CURRENT_SESSION_TOKEN = "";', f'let CURRENT_SESSION_TOKEN = "{cur_token}";')
                 if cur_user and cur_user.get("role") == "admin":
                     page_html = page_html.replace('id="tabBtnAdmin" style="display: none;"', 'id="tabBtnAdmin" style="display: inline-block;"')
                     u_disp = cur_user.get("display_name") or cur_user.get("username")
@@ -4099,10 +7028,139 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/task/status":
             running = is_task_running()
+            info = get_running_task_info() if running else None
+            payload = {"running": running}
+            if info:
+                payload["account_id"] = info.get("account_id", "")
+                payload["account_name"] = info.get("account_name", "")
+                payload["owner_username"] = info.get("owner_username", "")
+                payload["started_at"] = info.get("timestamp", 0)
+                payload["current_task"] = get_current_taskchain()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"running": running}).encode("utf-8"))
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        elif path == "/api/maa/config":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            acc_id = resolve_active_account_for_user(cur_user, params.get("account_id", [""])[0])
+            target_acc = db.get_account(acc_id)
+            if not target_acc:
+                self.send_json({"success": False, "error": "Account not found"}, code=404)
+                return
+            if cur_user.get("role") != "admin" and target_acc.get("owner_username") != cur_user.get("username"):
+                self.send_json({"success": False, "error": "Forbidden: Not your account"}, code=403)
+                return
+
+            cfg_rec = db.get_maa_config(acc_id)
+            if not cfg_rec or not cfg_rec.get("config"):
+                def_cfg = maa_config_adapter.get_default_maa_config(target_acc.get("account_name", ""))
+                db.save_maa_config(acc_id, target_acc.get("owner_username"), def_cfg)
+                cfg_rec = {"account_id": acc_id, "config": def_cfg, "config_name": "Default"}
+            else:
+                # 自动进行无损结构升级迁移
+                migrated = maa_config_adapter.migrate_legacy_config(cfg_rec.get("config", {}), target_acc.get("account_name", ""))
+                cfg_rec["config"] = migrated
+
+            # 附带该账号可用自定义基建排班文件 (账号维度) 与芯片掉落选项
+            try:
+                infra_files = list_infrast_plans(acc_id)
+            except Exception:
+                infra_files = []
+
+            self.send_json({
+                "success": True,
+                "account_id": acc_id,
+                "config_name": cfg_rec.get("config_name", "Default"),
+                "config": cfg_rec.get("config", {}),
+                "task_schema": getattr(maa_config_adapter, "TASK_SCHEMA", {}),
+                "task_catalog": getattr(maa_config_adapter, "TASK_CATALOG", []),
+                "infrast_files": infra_files,
+                "drop_stage_map": getattr(maa_config_adapter, "DROP_STAGE_MAP", {}),
+                "chip_drop_options": getattr(maa_config_adapter, "CHIP_DROP_OPTIONS", [])
+            })
+            return
+
+        elif path == "/api/maa/timers":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            acc_id = resolve_active_account_for_user(cur_user, params.get("account_id", [""])[0])
+            target_acc = db.get_account(acc_id)
+            if not target_acc:
+                self.send_json({"success": False, "error": "Account not found"}, code=404)
+                return
+            if cur_user.get("role") != "admin" and target_acc.get("owner_username") != cur_user.get("username"):
+                self.send_json({"success": False, "error": "Forbidden: Not your account"}, code=403)
+                return
+
+            timers_rec = db.get_maa_timers(acc_id)
+            if not timers_rec or not timers_rec.get("timers"):
+                def_timers = maa_config_adapter.get_default_maa_timers()
+                db.save_maa_timers(acc_id, target_acc.get("owner_username"), def_timers, window_minutes=40)
+                timers_rec = {"account_id": acc_id, "timers": def_timers, "window_minutes": 40}
+
+            # 汇总全系统所有已占用的 40 分钟独占时段
+            all_records = db.list_all_maa_timers()
+            all_slots = []
+            for r in all_records:
+                r_acc_id = r.get("account_id")
+                r_dur = int(r.get("window_minutes") or 40)
+                r_name = r.get("account_name") or r_acc_id
+                t_list = (r.get("timers") or {}).get("List", [])
+                for item in t_list:
+                    if item.get("IsEnabled"):
+                        h = int(item.get("Hour", 0))
+                        m = int(item.get("Minute", 0))
+                        is_mine = (r_acc_id == acc_id)
+                        all_slots.append({
+                            "account_id": r_acc_id if is_mine or cur_user.get("role") == "admin" else "",
+                            "account_name": r_name if is_mine or cur_user.get("role") == "admin" else "其他账号",
+                            "is_current": is_mine,
+                            "hour": h,
+                            "minute": m,
+                            "window_minutes": r_dur,
+                            "remark": item.get("Remark", "")
+                        })
+
+            self.send_json({
+                "success": True,
+                "account_id": acc_id,
+                "window_minutes": int(timers_rec.get("window_minutes") or 40),
+                "timers": timers_rec.get("timers", {}),
+                "all_slots": all_slots
+            })
+            return
+
+        elif path == "/api/maa/copilot/list":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            uname = cur_user.get("username", DEFAULT_ADMIN_USER)
+            categories = get_copilot_jobs_list(uname)
+            self.send_json({"success": True, "categories": categories})
+            return
+
+        elif path == "/api/maa/stages":
+            cur_user = self.get_current_user()
+            if not cur_user:
+                self.send_json({"success": False, "error": "Unauthorized"}, code=401)
+                return
+            try:
+                # 对齐 MAA 桌面版：精选常驻关卡 + 在线活动关卡(随官方 API 更新)
+                acc_id = params.get("account_id", [""])[0] or db.get_active_account_id()
+                acc = db.get_account(acc_id) or {}
+                client_type = "Bilibili" if acc.get("platform") == "Bilibili" else "Official"
+                catalog = maa_config_adapter.get_stage_catalog(client_type=client_type, include_activity=True)
+                self.send_json({"success": True, "categories": catalog.get("categories", [])})
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)}, code=500)
+            return
 
         elif path == "/api/emulator_status":
             alive = is_emulator_alive()
@@ -4124,11 +7182,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cur_user = self.get_current_user()
             uname = cur_user.get("username") if (cur_user and cur_user.get("role") != "admin") else None
             logs = get_today_logs(owner_username=uname, limit=250)
+            human_logs = get_today_human_logs(limit=100)
             cleanup_old_logs(days=30)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"logs": logs}).encode("utf-8"))
+            self.wfile.write(json.dumps({"logs": logs, "human_logs": human_logs}).encode("utf-8"))
 
         elif path == "/debug_img":
             cat = params.get("cat", [""])[0]
@@ -4147,17 +7206,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
         elif path == "/api/infrast_plan_info":
-            fname = urllib.parse.unquote(params.get("file", ["default_plan.json"])[0])
-            info = parse_infrast_schedule_info(fname)
+            fname = urllib.parse.unquote(params.get("file", [""])[0])
+            _cu = self.get_current_user()
+            acc_id = resolve_active_account_for_user(_cu, params.get("account_id", [""])[0])
+            info = parse_infrast_schedule_info(fname, account_id=acc_id)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(info).encode("utf-8"))
 
         elif path == "/api/infrast_plans":
-            cur_user = self.get_current_user()
-            uname = cur_user.get("username", DEFAULT_ADMIN_USER) if cur_user else DEFAULT_ADMIN_USER
-            plans = list_infrast_plans(owner_username=uname)
+            _cu = self.get_current_user()
+            acc_id = resolve_active_account_for_user(_cu, params.get("account_id", [""])[0])
+            plans = list_infrast_plans(account_id=acc_id)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -4173,7 +7234,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if cur_user.get("role") != "admin":
                 # 普通用户严格只查询自身名下的账号，绝不可查询或触碰管理员账号！
                 raw_accs = db.list_accounts(owner_username=cur_user.get("username"))
-                active_id = raw_accs[0]["id"] if raw_accs else ""
+                active_id = db.get_active_account_id(owner_username=cur_user.get("username"))
             else:
                 raw_accs = db.list_accounts()
                 active_id = db.get_active_account_id()
@@ -4181,12 +7242,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             safe_accounts = []
             for a in raw_accs:
                 a_copy = dict(a)
-                raw_pwd = a_copy.get("game_password", "")
-                a_copy["has_game_password"] = bool(raw_pwd)
-                if cur_user.get("role") == "admin" or a.get("owner_username") == cur_user.get("username"):
-                    a_copy["game_password"] = raw_pwd
-                else:
-                    a_copy["game_password"] = ""
+                # 系统不再保存/下发任何游戏账密，彻底剥离该字段
+                a_copy.pop("game_password", None)
                 safe_accounts.append(a_copy)
 
             out_data = {
@@ -4218,10 +7275,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(b'{"error": "privacy_shield"}')
                         return
                 else:
-                    # 模拟器空闲且非管理员：不进行后端截图
-                    self.send_response(503)
-                    self.end_headers()
-                    return
+                    # 模拟器空闲：仅当当前活动账号属于本人时允许查看，否则展示隐私遮罩
+                    cur_acc = db.get_account(db.get_active_account_id())
+                    if not (cur_acc and cur_acc.get("owner_username") == cur_user.get("username")):
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error": "privacy_shield"}')
+                        return
 
             if not is_emulator_alive():
                 self.send_response(503)
@@ -4246,12 +7307,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"error": "Unauthorized"}')
                 return
-            # 严格安全防护：监控大屏面向普通用户彻底只读，触控注入仅超级管理员可用
-            if cur_user.get("role") != "admin":
+
+            is_admin = bool(cur_user.get("role") == "admin")
+            running_info = get_running_task_info()
+            can_touch = False
+
+            if is_admin:
+                can_touch = True
+            elif running_info:
+                # 任务运行中：仅任务发起人本人可触控
+                if running_info.get("owner_username") == cur_user.get("username"):
+                    can_touch = True
+            else:
+                # 模拟器空闲：若活动账号属于本人，放行触控与文字注入 (用于手动输入账密首次登录)
+                cur_acc = db.get_account(db.get_active_account_id())
+                if cur_acc and cur_acc.get("owner_username") == cur_user.get("username"):
+                    can_touch = True
+
+            if not can_touch:
                 self.send_response(403)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": "forbidden", "message": "大屏已设为纯净只读监控，触控仅对超级管理员开放"}).encode("utf-8"))
+                self.wfile.write(json.dumps({"error": "forbidden", "message": "其他账号正在运行或占用中，触控已安全锁定"}).encode("utf-8"))
                 return
             if path == "/tap":
                 x = params.get("x", ["0"])[0]
@@ -4280,7 +7357,142 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+def _iter_arknights_procs():
+    """
+    只读列出方舟相关进程，返回 [(pid, ppid, name, comm)]。
+    通过 /proc/<pid>/comm 取真实线程名 (shell 权限即可读)：
+      - 主进程 comm 形如 'gryph.arknights' (以 '.arknights' 结尾)
+      - Unity 派生的残留子进程 comm 形如 'sm-thread-http1/2'
+      - ':GP7Service' 等独立进程 comm 形如 'ghts:GP7Service'
+    """
+    procs = []
+    try:
+        shell_cmd = (
+            "ps -A -o PID,PPID,NAME | grep -E 'com.hypergryph.arknights|com.bilibili.arknights' | "
+            "while read pid ppid name; do comm=$(cat /proc/$pid/comm 2>/dev/null); "
+            "echo \"$pid $ppid $name $comm\"; done"
+        )
+        res = subprocess.run(
+            [ADB, "-s", DEVICE, "shell", shell_cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+                comm = parts[3] if len(parts) >= 4 else ""
+                procs.append((int(parts[0]), int(parts[1]), parts[2], comm))
+    except Exception:
+        pass
+    return procs
+
+def _is_main_proc(comm):
+    """主进程判定：comm 以 '.arknights' 结尾 (如 gryph.arknights / bili.arknights)。"""
+    return comm.endswith(".arknights")
+
+def _classify_arknights_procs(procs):
+    """
+    将方舟「裸名进程」分类 (带 ':' 后缀的 :GP7Service/:GP7Worker/:pushcore 一律不动):
+      - mains:   主进程 (comm 以 '.arknights' 结尾)，正常恰好 1 个
+      - leaked:  PPID==1 的 Unity 残留子进程 (comm 非主进程，如 sm-thread-http*)，可安全清理；
+                 这些是主进程被 MAA/守护重启后 reparent 到 init 的泄漏，各占约 1GB。
+    关键：不以 PPID==1 单独判定 —— 主进程即便因 zygote 重启变为 PPID==1 也一律保留，
+    因此手动态/正在运行的实例永不被误杀。
+    """
+    bare_names = ("com.hypergryph.arknights", "com.bilibili.arknights")
+    mains, leaked = [], []
+    for pid, ppid, name, comm in procs:
+        if name not in bare_names:
+            continue  # 独立子进程 (:GP7Service 等) 不参与回收
+        if _is_main_proc(comm):
+            mains.append((pid, ppid, name, comm))
+        elif ppid == 1:
+            leaked.append((pid, ppid, name, comm))
+    return mains, leaked
+
+def _module_ensure_adb_root(cache={"t": 0.0}):
+    """
+    确保 adb 处于 root (redroid 容器重启后会丢失 root，导致 kill 静默失败)。
+    至少每 5 分钟校验一次，避免频繁 root 触发 adbd 重连。
+    """
+    now = time.time()
+    if now - cache["t"] < 300:
+        return
+    try:
+        out = subprocess.run([ADB, "-s", DEVICE, "shell", "id"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=6).stdout
+        if "uid=0" not in out:
+            subprocess.run([ADB, "-s", DEVICE, "root"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            time.sleep(1.5)
+            subprocess.run([ADB, "connect", DEVICE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        cache["t"] = now
+    except Exception:
+        pass
+
+def reap_orphan_arknights_processes():
+    """
+    精准的进程健康巡检 (绝不干扰手动登录/正在运行的实例)：
+      1) 清理 PPID==1 的 Unity 残留子进程 (comm 非主进程，如 sm-thread-http*)；
+      2) 重复「主进程」(comm 以 '.arknights' 结尾) 叠加时，保留 PID 最大(最新)的一个，
+         其余连同其 worker 子进程一并清理。
+    主进程本身永不被作为孤儿清理 —— 手动态绝不受影响。
+    """
+    procs = _iter_arknights_procs()
+    if not procs:
+        return 0
+    mains, leaked = _classify_arknights_procs(procs)
+    if not leaked and len(mains) <= 1:
+        return 0
+    _module_ensure_adb_root()
+    killed = 0
+
+    def _kill(pid):
+        nonlocal killed
+        try:
+            subprocess.run([ADB, "-s", DEVICE, "shell", "kill", "-9", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            killed += 1
+        except Exception:
+            pass
+
+    # 1) 清理 Unity 残留子进程 (PPID==1 且非主进程)
+    for pid, _ppid, _name, _comm in leaked:
+        _kill(pid)
+
+    # 2) 重复主进程治理 (保留最新，连同旧主进程的 worker 一起清)
+    if len(mains) > 1:
+        mains.sort(key=lambda x: x[0])  # PID 升序，最新在最后
+        keep_pid = mains[-1][0]
+        stale_pids = {m[0] for m in mains[:-1]}
+        print(f"[Reaper] 检测到重复方舟主进程 {len(mains)} 个 (保留最新 PID={keep_pid})，已清理旧副本及其子进程。", flush=True)
+        for pid, _ppid, _name, _comm in mains[:-1]:
+            _kill(pid)
+        # 旧主进程的 worker 子进程 (PPID 为旧主进程 PID，或已 reparent)
+        for pid, ppid, _name, _comm in procs:
+            if ppid in stale_pids and not _is_main_proc(_comm):
+                _kill(pid)
+
+    if killed:
+        print(f"[Reaper] 已清理方舟残留子进程/重复主进程 {killed} 个 (防 OOM)。", flush=True)
+    return killed
+
+def start_orphan_reaper():
+    def _loop():
+        # 启动时先清理一次，避免历史残留叠加
+        try:
+            reap_orphan_arknights_processes()
+        except Exception:
+            pass
+        while True:
+            time.sleep(10)
+            try:
+                reap_orphan_arknights_processes()
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
 if __name__ == "__main__":
+    start_orphan_reaper()
     with ThreadingTCPServer(("0.0.0.0", PORT), Handler) as httpd:
         print(f"ArkWeb control panel listening on 0.0.0.0:{PORT}...")
         httpd.serve_forever()

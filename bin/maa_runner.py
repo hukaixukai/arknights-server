@@ -11,9 +11,19 @@ import subprocess
 import re
 import fcntl
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 import notifier
 import db
+import hypergryph_guard
+
+# 强制统一时区为北京时间，确保周计划判定、公招 04:00 刷新、基建时间轮换等
+# 与游戏日一致 (避免容器默认 UTC 导致选班/周计划错位)
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except Exception:
+    pass
 
 def find_adb():
     candidate = shutil.which("adb")
@@ -50,8 +60,28 @@ DEPOT_FILE = MAA_DIR / "data" / "DepotData.json"
 OPER_BOX_FILE = MAA_DIR / "data" / "OperBoxData.json"
 EVENT_6STAR_FILE = pathlib.Path(os.getenv("EVENT_6STAR_FILE", str(BASE_DIR / "data" / "recruit_6star_event.json")))
 COMPOSE_FILE = BASE_DIR / "docker-compose.yml"
+# 容器由 compose 项目 arknights 创建；在 /app 目录下默认项目名会变成 "app"，
+# 导致 docker compose stop/up 静默失效 (模拟器永远停不掉)。显式指定项目名修复。
+COMPOSE_PROJECT = os.getenv("COMPOSE_PROJECT_NAME", "arknights")
+
+
+def compose_cmd(*args):
+    """构造带显式项目名的 docker compose 命令。"""
+    return ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", str(COMPOSE_FILE)] + list(args)
+
 ADB_BIN = os.getenv("ADB_BIN", find_adb())
-ADB_TARGET = os.getenv("ADB_TARGET", "127.0.0.1:5555")
+def get_live_adb_target():
+    try:
+        out = subprocess.check_output([ADB_BIN, "devices"], text=True)
+        devices = [l.split()[0] for l in out.splitlines() if "\tdevice" in l]
+        if "emulator-5554" in devices: return "emulator-5554"
+        if "127.0.0.1:5555" in devices: return "127.0.0.1:5555"
+        if devices: return devices[0]
+    except Exception:
+        pass
+    return "127.0.0.1:5555"
+
+ADB_TARGET = get_live_adb_target()
 
 PROFILES_DIR = BASE_DIR / "data" / "account_profiles"
 LOCK_FILE_PATH = pathlib.Path("/tmp/ark_runner.lock")
@@ -98,6 +128,69 @@ def get_account_oper_box_file(acc_id):
 def get_account_6star_event_file(acc_id):
     return get_account_dir(acc_id) / "recruit_6star_event.json"
 
+def get_account_switch_key(account):
+    """
+    计算用于 MAA 触屏账号切换 (StartUp.account_name) 的匹配标识。
+    MAA 仅支持切换至设备已登录过的账号，用登录名唯一子串匹配:
+      官服: 输入尾号(如 4567) 即可匹配 123****4567
+    这里优先用纯数字尾号；账号标识本身非数字 (如 B 服的 用户名) 则原样返回。
+    """
+    raw = str(account.get("account_name", "") or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 4:
+        return digits[-4:]
+    return raw
+
+def get_device_active_account_key(pkg="com.hypergryph.arknights"):
+    """
+    只读探测设备当前实际登录的账号标识 (不修改任何文件)。
+    优先官方 SDK USER_CACHE 的 phone 尾号；SDK 为空时回退游戏 playerprefs 的
+    HGSDKV2_USERNAME (游戏自身记录的当前登录账号)。读取失败返回 ""。
+    """
+    try:
+        res = subprocess.run(
+            [ADB_BIN, "-s", ADB_TARGET, "shell",
+             f"cat /data/data/{pkg}/shared_prefs/HypergryphSdkPreferences.xml 2>/dev/null || true"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m = re.search(r'"phone"\s*:\s*"([^"]+)"', res.stdout)
+        if not m:
+            m = re.search(r'&quot;phone&quot;:&quot;([^&]+)&quot;', res.stdout)
+        if m:
+            digits = re.sub(r"\D", "", m.group(1))
+            if digits:
+                return digits[-4:] if len(digits) >= 4 else digits
+    except Exception:
+        pass
+    # 回退：游戏 playerprefs 记录的用户名 (如 130****8019)
+    try:
+        res2 = subprocess.run(
+            [ADB_BIN, "-s", ADB_TARGET, "shell",
+             f"cat /data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml 2>/dev/null || true"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m2 = re.search(r'HGSDKV2_USERNAME"[^>]*>([^<]+)<', res2.stdout)
+        if m2:
+            digits = re.sub(r"\D", "", m2.group(1))
+            return digits[-4:] if len(digits) >= 4 else m2.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+def load_account_depot(acc_id):
+    """读取指定账号最近一次仓库识别缓存 (item_id -> 数量)。"""
+    if not acc_id:
+        return {}
+    try:
+        f = get_account_depot_file(acc_id)
+        if not f.exists() and DEPOT_FILE.exists():
+            f = DEPOT_FILE
+        if f.exists():
+            d = json.load(open(f, "r", encoding="utf-8"))
+            data = d.get("data", d) if isinstance(d, dict) else {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
 sys.path.insert(0, str(PYTHON_DIR))
 
 from asst.asst import Asst
@@ -105,6 +198,7 @@ from asst.utils import Message, InstanceOptionType
 
 OWNED_6STAR_SET = set()
 CURRENT_ACCOUNT_DATA = {}
+_NEED_ACCOUNT_SWITCH = False
 
 def load_accounts_file():
     accs = db.list_accounts()
@@ -136,26 +230,54 @@ def list_available_infrast_plans():
             plans.append(p.name)
     return sorted(plans)
 
-def resolve_infrast_file(plan_filename, owner_username=None):
+def resolve_infrast_file(plan_filename, owner_username=None, account_id=None):
+    """按方舟账号维度解析自定义基建排班文件 (每账号一个目录，仅保留一个文件)。"""
     if not plan_filename:
-        plan_filename = "default_plan.json"
+        return ""
     if not plan_filename.endswith(".json"):
         plan_filename += ".json"
-    
-    owner = owner_username or (CURRENT_ACCOUNT_DATA.get("owner_username") if CURRENT_ACCOUNT_DATA else DEFAULT_ADMIN_USER)
-    
-    # 1. 严格在所有者专属隔离目录查找
-    target = INFRAST_DIR / owner / plan_filename
-    if target.exists():
-        return str(target)
-    
-    # 2. 检查公共共享根目录 (绝不向其他用户私有目录借读！)
-    public_target = INFRAST_DIR / plan_filename
-    if public_target.exists():
-        return str(public_target)
 
-    # 若不存在，返回用户隔离目录的预期路径
-    return str(target)
+    acc_id = account_id or (CURRENT_ACCOUNT_DATA.get("id") if CURRENT_ACCOUNT_DATA else None)
+    if acc_id:
+        target = INFRAST_DIR / str(acc_id) / plan_filename
+        if target.exists():
+            return str(target)
+        # 兜底：该账号目录内任意 json
+        acc_dir = INFRAST_DIR / str(acc_id)
+        if acc_dir.exists():
+            found = sorted(acc_dir.glob("*.json"))
+            if found:
+                return str(found[0])
+        return str(target)
+
+    # 无账号上下文时的极简兜底
+    return str(INFRAST_DIR / plan_filename)
+
+def resolve_copilot_file(filename, owner_username=None):
+    if not filename:
+        return None
+    p = pathlib.Path(filename)
+    if p.is_file():
+        return str(p.resolve())
+
+    owner = owner_username or (CURRENT_ACCOUNT_DATA.get("owner_username") if CURRENT_ACCOUNT_DATA else DEFAULT_ADMIN_USER)
+    u_dir = BASE_DIR / "data" / "copilot_uploads"
+    if (u_dir / owner / filename).is_file():
+        return str((u_dir / owner / filename).resolve())
+    if (u_dir / filename).is_file():
+        return str((u_dir / filename).resolve())
+
+    c_dir = MAA_DIR / "resource" / "copilot"
+    if (c_dir / filename).is_file():
+        return str((c_dir / filename).resolve())
+
+    # 递归模糊匹配
+    clean_name = p.stem.strip()
+    for match in c_dir.rglob("*.json"):
+        if clean_name in match.stem:
+            return str(match.resolve())
+
+    return str(p)
 
 def load_owned_6stars(acc_id=None):
     global OWNED_6STAR_SET
@@ -379,36 +501,50 @@ def log_callback(msg, details, arg):
             handle_6star_recruit_event(raw_tags, result_list)
 
 def calculate_plan_index(infrast_path):
+    """
+    自定义基建排班的「时间轮换」选班 (对齐 MAA 桌面版 InfrastSettingsUserControlModel)。
+
+    背景: MAA 协议文档明确指出 period 字段 Core 不处理，需由集成层按时间自行选择 plan_index。
+    MAA 官方规则 (PlanSelect == -1 时间轮换):
+      - 取「任一 period 覆盖当前时间」的第一个方案；
+      - 无任何方案匹配则回退方案 0。
+
+    边界处理: MAA 的 now 是带毫秒的 TimeOnly，闭区间仅在恰好 :00.000 命中上一个方案；
+    我们的定时器在 10:00/16:00/22:00 精确触发，且选班发生在启动守护之后 (仍处于整点分钟)，
+    因此采用「左闭右开 [start, end)」以在整点正确交接下一班；对 23:59/24:00 收尾端点保持闭区间，
+    以覆盖当天最后时段 (与文件习惯写法一致)。
+    """
     try:
         with open(infrast_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        now_str = time.strftime("%H:%M")
         plans = data.get("plans", [])
+        if not plans:
+            return 0
+
+        now_str = time.strftime("%H:%M")
         for idx, plan in enumerate(plans):
             for period in plan.get("period", []):
                 if len(period) == 2:
-                    start, end = period[0], period[1]
+                    start, end = str(period[0]), str(period[1])
                     if start <= end:
-                        is_match = (start <= now_str <= end) if end in ("23:59", "24:00") else (start <= now_str < end)
-                        if is_match:
-                            print(f"[+] 当前时间 {now_str} 匹配到排班: {plan.get('name', idx)} (index={idx})")
+                        # 左闭右开；收尾端点 23:59/24:00 视为闭区间
+                        hit = (start <= now_str <= end) if end in ("23:59", "24:00") else (start <= now_str < end)
+                        if hit:
+                            print(f"[+] 自定义基建时间轮换: 当前 {now_str} 命中方案 [{plan.get('name', idx)}] (index={idx})")
                             return idx
                     else:
+                        # 跨午夜 (start > end): now >= start 或 now < end
                         if now_str >= start or now_str < end:
-                            print(f"[+] 当前时间 {now_str} 跨午夜匹配到排班: {plan.get('name', idx)} (index={idx})")
+                            print(f"[+] 自定义基建时间轮换(跨午夜): 当前 {now_str} 命中方案 [{plan.get('name', idx)}] (index={idx})")
                             return idx
+
+        # 无任何方案覆盖当前时间 -> 与 MAA 一致，回退方案 0
+        print(f"[!] 自定义基建: 当前 {now_str} 未命中任何方案的时间段，按 MAA 规则回退方案 0。")
+        return 0
     except Exception as e:
         print(f"[!] 排班表时间匹配异常: {e}")
+        return 0
 
-    hour = time.localtime().tm_hour
-    if 10 <= hour < 16:
-        idx = 0
-    elif 16 <= hour < 22:
-        idx = 1
-    else:
-        idx = 2
-    print(f"[+] 按小时 ({hour}:00) 匹配到默认班次: index={idx}")
-    return idx
 
 
 def kill_rogue_browsers():
@@ -424,127 +560,213 @@ def kill_rogue_browsers():
     except Exception:
         pass
 
-def sanitize_profile_sdk_prefs(xml_path, expected_phone):
-    if not xml_path or not os.path.exists(str(xml_path)):
-        return
-    try:
-        import xml.etree.ElementTree as ET
-        tree = ET.parse(str(xml_path))
-        root = tree.getroot()
-        matched_hg_ids = set()
-        modified = False
-        for s in root.findall('string'):
-            name = s.attrib.get('name')
-            if name == 'USER_CACHE' and s.text:
-                try:
-                    users = json.loads(s.text)
-                    filtered = [u for u in users if u.get('phone') == expected_phone]
-                    for u in filtered:
-                        if 'hgId' in u:
-                            matched_hg_ids.add(str(u['hgId']))
-                    if len(filtered) != len(users):
-                        s.text = json.dumps(filtered)
-                        modified = True
-                except Exception:
-                    pass
-        for s in root.findall('string'):
-            name = s.attrib.get('name')
-            if name == 'DEVICE_CACHE' and s.text and matched_hg_ids:
-                try:
-                    devs = json.loads(s.text)
-                    filtered_devs = [d for d in devs if str(d.get('hgId')) in matched_hg_ids]
-                    if len(filtered_devs) != len(devs):
-                        s.text = json.dumps(filtered_devs)
-                        modified = True
-                except Exception:
-                    pass
-        if modified:
-            tree.write(str(xml_path), encoding='utf-8', xml_declaration=True)
-    except Exception as e:
-        print(f"[!] 纯净化 SDK Preferences 异常: {e}")
-
-def get_device_active_account_phone(pkg="com.hypergryph.arknights"):
+def force_kill_arknights(pkg="com.hypergryph.arknights", deep=False):
     """
-    直接从设备底层提取当前实际生效的登录账号手机号掩码
-    优先从官方 SDK 底层 HypergryphSdkPreferences.xml 的 USER_CACHE 读取；
-    若未检出则退回 playerprefs.xml 的 HGSDKV2_USERNAME。
+    彻底清理明日方舟全部相关进程 (主进程 + GP7Service/GP7Worker 等 Unity 子进程)。
+    Android 的 am force-stop 常常无法回收 Unity 多进程，残留进程各占约 1GB，
+    多次运行后会触发内核 OOM killer，导致下一次启动直接黑屏闪退。
     """
+    # 1. 常规 force-stop
     try:
-        # 1. 优先读取官方 Hypergryph SDK 会话
-        res_sdk = subprocess.run([
-            ADB_BIN, "-s", ADB_TARGET, "shell",
-            f"cat /data/data/{pkg}/shared_prefs/HypergryphSdkPreferences.xml 2>/dev/null || true"
-        ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
-        if res_sdk.stdout and "USER_CACHE" in res_sdk.stdout:
-            for line in res_sdk.stdout.splitlines():
-                if "USER_CACHE" in line:
-                    m = re.search(r'>(\[.+\])<', line)
-                    if m:
-                        raw_json = m.group(1).replace("&quot;", '"').replace("&amp;", "&")
-                        users = json.loads(raw_json)
-                        if users and isinstance(users, list) and len(users) > 0 and "phone" in users[0]:
-                            return str(users[0]["phone"]).strip()
+        subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
 
-        # 2. 备用读取 Unity 运行时 playerprefs.xml
-        res = subprocess.run([
-            ADB_BIN, "-s", ADB_TARGET, "shell",
-            f"cat /data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml 2>/dev/null || true"
-        ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+    # kill -9 需要 root (redroid 重启后会丢失 root)
+    try:
+        ensure_adb_root()
+    except Exception:
+        pass
+
+    # 2. 深度清理：列出所有含包名的进程并 kill -9
+    killed = 0
+    try:
+        res = subprocess.run(
+            [ADB_BIN, "-s", ADB_TARGET, "shell", f"ps -A -o PID,NAME | grep {pkg}"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=8)
         for line in res.stdout.splitlines():
-            if "HGSDKV2_USERNAME" in line:
-                m = re.search(r'>([^<]+)<', line)
-                if m:
-                    return m.group(1).strip()
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                try:
+                    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "kill", "-9", parts[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    killed += 1
+                except Exception:
+                    pass
     except Exception:
         pass
-    return None
 
-def get_app_uid(pkg="com.hypergryph.arknights"):
+    if killed:
+        print(f"[+] 已强制清理明日方舟残留进程 {killed} 个 (防 OOM 黑屏)。")
+    if deep:
+        # 3. 极致清理：连同包相关的一切服务进程一并清理
+        try:
+            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"pkill -9 -f {pkg}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        except Exception:
+            pass
+    return killed
+
+def _iter_arknights_procs(pkg="com.hypergryph.arknights"):
+    """
+    只读列出方舟相关进程，返回 [(pid, ppid, name, comm)]。
+    通过 /proc/<pid>/comm 取真实线程名 (shell 权限即可读)：
+      - 主进程 comm 以 '.arknights' 结尾 (如 gryph.arknights)
+      - Unity 残留子进程 comm 形如 'sm-thread-http1/2'
+    """
+    procs = []
     try:
-        res = subprocess.run([
-            ADB_BIN, "-s", ADB_TARGET, "shell",
-            f"dumpsys package {pkg} 2>/dev/null | grep userId= | head -n 1"
-        ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
-        m = re.search(r'userId=(\d+)', res.stdout)
-        if m:
-            return f"u0_a{int(m.group(1)) % 100000}"
+        shell_cmd = (
+            f"ps -A -o PID,PPID,NAME | grep -E '{pkg}|com.bilibili.arknights' | "
+            "while read pid ppid name; do comm=$(cat /proc/$pid/comm 2>/dev/null); "
+            "echo \"$pid $ppid $name $comm\"; done"
+        )
+        res = subprocess.run(
+            [ADB_BIN, "-s", ADB_TARGET, "shell", shell_cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+                comm = parts[3] if len(parts) >= 4 else ""
+                procs.append((int(parts[0]), int(parts[1]), parts[2], comm))
     except Exception:
         pass
-    return "u0_a116"
+    return procs
+
+def _is_main_proc(comm):
+    """主进程判定：comm 以 '.arknights' 结尾。"""
+    return comm.endswith(".arknights")
+
+def _classify_arknights_procs(procs, pkg="com.hypergryph.arknights"):
+    """
+    将方舟「裸名进程」分类 (带 ':' 后缀的 :GP7Service/:GP7Worker/:pushcore 一律不动):
+      - mains:  主进程 (comm 以 '.arknights' 结尾)，正常恰好 1 个
+      - leaked: PPID==1 的 Unity 残留子进程 (comm 非主进程，如 sm-thread-http*)，可安全清理
+    主进程即便因 zygote 重启变为 PPID==1 也一律保留，手动态永不被误杀。
+    """
+    bare_names = (pkg, "com.bilibili.arknights")
+    mains, leaked = [], []
+    for pid, ppid, name, comm in procs:
+        if name not in bare_names:
+            continue
+        if _is_main_proc(comm):
+            mains.append((pid, ppid, name, comm))
+        elif ppid == 1:
+            leaked.append((pid, ppid, name, comm))
+    return mains, leaked
+
+def reap_orphan_arknights(pkg="com.hypergryph.arknights"):
+    """
+    精准回收「残留子进程/重复主进程」(绝不干扰正在运行的实例)：
+      1) 清理 PPID==1 的 Unity 残留子进程 (comm 非主进程)；
+      2) 重复主进程 (comm 以 '.arknights' 结尾) 叠加时，保留最新，清旧及其子进程。
+    主进程本身永不被作为孤儿清理。
+    """
+    procs = _iter_arknights_procs(pkg)
+    if not procs:
+        return 0
+    mains, leaked = _classify_arknights_procs(procs, pkg)
+    if not leaked and len(mains) <= 1:
+        return 0
+    # kill 需要 root (redroid 重启后会丢失 root，导致 kill 静默失败)
+    try:
+        ensure_adb_root()
+    except Exception:
+        pass
+    killed = 0
+
+    def _kill(pid):
+        nonlocal killed
+        try:
+            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "kill", "-9", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            killed += 1
+        except Exception:
+            pass
+
+    # 1) Unity 残留子进程
+    for pid, _ppid, _name, _comm in leaked:
+        _kill(pid)
+
+    # 2) 重复主进程治理
+    if len(mains) > 1:
+        mains.sort(key=lambda x: x[0])
+        keep_pid = mains[-1][0]
+        stale_pids = {m[0] for m in mains[:-1]}
+        print(f"[!] 检测到重复方舟主进程 {len(mains)} 个 (保留最新 PID={keep_pid})，已清理旧副本及其子进程。", flush=True)
+        for pid, _ppid, _name, _comm in mains[:-1]:
+            _kill(pid)
+        for pid, ppid, _name, _comm in procs:
+            if ppid in stale_pids and not _is_main_proc(_comm):
+                _kill(pid)
+
+    if killed:
+        print(f"[+] 已回收孤儿游戏残留/重复主进程 {killed} 个 (防 OOM 黑屏)。")
+    return killed
+
+def count_arknights_mains(pkg="com.hypergryph.arknights"):
+    """返回真正的主进程数量 (comm 以 '.arknights' 结尾)。正常为 0 或 1。"""
+    procs = _iter_arknights_procs(pkg)
+    return len(_classify_arknights_procs(procs, pkg)[0])
+
+def _minutes_until_next_schedule(horizon_minutes=60):
+    """
+    检查全服所有账号的定时班次 (maa_timers) 中，是否存在未来 horizon_minutes
+    分钟内将要触发的任务。返回 (has_upcoming, nearest_minutes)。
+    用于智能退出策略：临近有任务 -> 保留模拟器；长时间无任务 -> 关闭模拟器省电。
+    """
+    try:
+        now = datetime.datetime.now()
+        now_min = now.hour * 60 + now.minute
+        nearest = 10 ** 9
+        for rec in db.list_all_maa_timers():
+            t_list = (rec.get("timers") or {}).get("List", [])
+            for item in t_list:
+                if not item.get("IsEnabled"):
+                    continue
+                h = int(item.get("Hour", 0))
+                m = int(item.get("Minute", 0))
+                slot = h * 60 + m
+                delta = (slot - now_min) % 1440
+                if 0 <= delta <= horizon_minutes:
+                    if delta < nearest:
+                        nearest = delta
+        if nearest < 10 ** 9:
+            return True, nearest
+        return False, None
+    except Exception as e:
+        print(f"[!] 智能退出策略：查询未来班次异常，默认保留模拟器: {e}")
+        # 异常时保守处理：保留模拟器，避免误关导致下一班无法启动
+        return True, None
+
 
 def execute_exit_action(on_complete):
     kill_rogue_browsers()
     pkg = "com.bilibili.arknights" if CURRENT_ACCOUNT_DATA.get("platform") == "Bilibili" else "com.hypergryph.arknights"
-    
-    # 退出前安全备份：严格核验设备内真实生效的账号才允许落盘，严禁覆盖其他账号！
-    try:
-        ensure_adb_root()
-        device_phone = get_device_active_account_phone(pkg)
-        target_phone = str(CURRENT_ACCOUNT_DATA.get("account_name", "")).strip()
-        target_masked = f"{target_phone[:3]}****{target_phone[-4:]}" if len(target_phone) >= 7 else target_phone
-        curr_id = CURRENT_ACCOUNT_DATA.get("id")
 
-        if curr_id and device_phone == target_masked:
-            prof_dest = PROFILES_DIR / curr_id / "shared_prefs"
-            prof_dest.mkdir(parents=True, exist_ok=True)
-            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "pull", f"/data/data/{pkg}/shared_prefs/.", str(prof_dest)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[+] 任务结束：已安全同步账号 [{CURRENT_ACCOUNT_DATA.get('name')}] 最新会话至独立存档。")
-    except Exception as e:
-        print(f"[!] 退出会话归档跳过: {e}")
+    # 说明: 本系统已改为 MAA 原生触屏账号切换，不再读写/归档任何游戏配置文件。
 
-    print(f"\n[*] 任务完成，正在执行退出动作: [{on_complete}]...")
-    if on_complete == "stop_emu":
-        print("[+] 正在关闭明日方舟客户端...")
-        subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 智能退出策略：auto 模式下按「未来 1 小时内是否有班次」决定关游戏还是关模拟器
+    effective_action = on_complete
+    if on_complete == "auto":
+        has_upcoming, nearest = _minutes_until_next_schedule(60)
+        if has_upcoming:
+            effective_action = "close_game"
+            print(f"[+] 智能退出策略：{('约 ' + str(nearest) + ' 分钟后') if nearest is not None else '近期'}还有排班任务，仅关闭游戏并保留模拟器待命。")
+        else:
+            effective_action = "stop_emu"
+            print("[+] 智能退出策略：未来 1 小时内无任何排班任务，关闭游戏并停止模拟器以释放硬件资源。")
+
+    print(f"\n[*] 任务完成，正在执行退出动作: [{effective_action}] (原始策略={on_complete})...")
+    if effective_action == "stop_emu":
+        print("[+] 正在关闭明日方舟客户端 (含全部 Unity 子进程)...")
+        force_kill_arknights(pkg, deep=True)
         print("[+] 正在停止安卓模拟器 (ReDroid) 容器以完全释放 4GB+ 内存与 GPU...")
-        subprocess.run(["docker", "compose", "-f", str(COMPOSE_FILE), "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(compose_cmd("stop", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([ADB_BIN, "disconnect", ADB_TARGET], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("[✔] 模拟器已完全停止，硬件资源已彻底释放！")
-    elif on_complete == "close_game":
+    elif effective_action == "close_game":
         print("[+] 正在关闭明日方舟客户端并保持模拟器运行...")
-        subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        force_kill_arknights(pkg, deep=True)
         print("[✔] 客户端已退出，模拟器保持待命状态。")
-    elif on_complete == "keep_running":
+    elif effective_action == "keep_running":
         print("[+] 保持当前前台与模拟器运行状态不变。")
 
 
@@ -651,6 +873,9 @@ def guard_game_startup(pkg, platform):
     3. 若真卡死无流量超过 60 秒，自动强杀重启重试。
     """
     print(f"[*] 启动游戏守护探针: 正在预唤醒客户端 [{pkg}] 并探测更新状态...")
+    # 启动前彻底清理残留进程，避免历史孤儿进程叠加导致 OOM 黑屏
+    force_kill_arknights(pkg)
+    time.sleep(2)
     subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "start", "-n", f"{pkg}/com.u8.sdk.U8UnityContext"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     last_rx = get_device_rx_bytes()
@@ -712,7 +937,8 @@ def guard_game_startup(pkg, platform):
             if restarts < max_restarts:
                 restarts += 1
                 print(f"[!] 警告: 客户端启动 60 秒无网络数据流动，判定为 CDN 握手假死！正在执行看门狗强杀重启 (第 {restarts}/{max_restarts} 次)...")
-                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 深度清理全部子进程，避免残留进程堆积触发 OOM
+                force_kill_arknights(pkg, deep=True)
                 time.sleep(2)
                 subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "start", "-n", f"{pkg}/com.u8.sdk.U8UnityContext"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 stall_sec = 0
@@ -724,288 +950,54 @@ def guard_game_startup(pkg, platform):
 
     return True
 
-def auto_login_arknights(account):
-    """
-    全自动首次登入流程：适用于 Web 注册的全新账号或 Session 已经失效的账号。
-    通过 Android 原生 UIAutomator 抓取控件并注入账号与密码，建立永久 Session 会话。
-    """
-    phone = str(account.get("account_name", "")).strip()
-    password = str(account.get("game_password", "")).strip()
-    acc_name = account.get("name", "未命名账号")
-    acc_id = account.get("id")
-    pkg = "com.bilibili.arknights" if account.get("platform") == "Bilibili" else "com.hypergryph.arknights"
-
-    if not phone or not password:
-        print(f"[!] 账号 [{acc_name}] 缺少绑定的手机号或密码，无法执行全自动登入！")
-        return False
-
-    phone_masked = f"{phone[:3]}****{phone[-4:]}" if len(phone) >= 7 else phone
-    print(f"[*] 启动账号 [{acc_name}] ({phone_masked}) 全自动登入引擎...")
-    ensure_adb_root()
-
-    # 1. 关键优化：绝不删除 playerprefs.xml！保留画质与热更分包资源标记，仅重置官方 SDK 为干净的未登入态
-    clean_sdk_xml = '''<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
-<map>
-    <string name="DEVICE_CACHE">[]</string>
-    <string name="USER_CACHE">[]</string>
-    <boolean name="cache_account_times" value="true" />
-    <string name="HypergryphUserProtocol">1</string>
-    <boolean name="IS_AUTO_LOGIN" value="false" />
-</map>'''
-
-    # 若设备内缺失基础 playerprefs.xml，从任意已有档案复制一份作为基底，防止弹出完整资源确认框
-    dev_pref_chk = subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"test -f /data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml && echo YES"], stdout=subprocess.PIPE, text=True)
-    if "YES" not in dev_pref_chk.stdout:
-        base_pref = None
-        for _pf in sorted(PROFILES_DIR.glob("*/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml")):
-            base_pref = _pf
-            break
-        if base_pref and base_pref.exists():
-            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "push", str(base_pref), f"/data/data/{pkg}/shared_prefs/com.hypergryph.arknights.v2.playerprefs.xml"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 推送重置后的 SDK 登录凭据
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
-        tf.write(clean_sdk_xml)
-        tmp_sdk_path = tf.name
-    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "push", tmp_sdk_path, f"/data/data/{pkg}/shared_prefs/HypergryphSdkPreferences.xml"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        os.unlink(tmp_sdk_path)
-    except Exception:
-        pass
-
-    # 修复属主权限
-    uid = get_app_uid(pkg)
-    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"chown -R {uid}:{uid} /data/data/{pkg}/shared_prefs/ && chmod -R 777 /data/data/{pkg}/shared_prefs/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 停止并重新启动游戏
-    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-
-    print("[+] 正在唤醒明日方舟客户端进入登录流程...")
-    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "start", "-n", f"{pkg}/com.u8.sdk.U8UnityContext"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    start_time = time.time()
-    login_submitted = False
-    max_wait = 180
-
-    while time.time() - start_time < max_wait:
-        time.sleep(3)
-        xml = dump_ui_xml()
-        if not xml:
-            continue
-
-        # 0. 兜底处理可能弹出的用户协议/隐私政策提示 (精确匹配按钮，杜绝匹配大段正文)
-        agree_btn = find_node_bounds(xml, text="同意并继续", exact=True) or find_node_bounds(xml, text="同意", exact=True)
-        if agree_btn:
-            print(f"[+] 检测到用户协议弹窗，精准点击【同意并继续】: {agree_btn}...")
-            tap_screen(*agree_btn)
-            time.sleep(2)
-            continue
-        elif "用户协议和游戏隐私政策提示" in xml:
-            print("[+] 检出协议弹窗特征，点击默认按钮区域 (812, 522)...")
-            tap_screen(812, 522)
-            time.sleep(2)
-            continue
-
-        # 0.1 兜底处理下载资源提示
-        res_btn = find_node_bounds(xml, text="确认", exact=True)
-        if res_btn and "下载" in xml:
-            print(f"[+] 检测到资源确认弹窗，点击确认: {res_btn}...")
-            tap_screen(*res_btn)
-            time.sleep(2)
-            continue
-
-        # 1. 密码登录表单已显示
-        pwd_box = find_node_bounds(xml, resource_id="hg_login_view_edit_text_input_password")
-        acc_box = find_node_bounds(xml, resource_id="hg_login_view_edit_text_input_account")
-
-        if pwd_box and acc_box and not login_submitted:
-            print(f"[+] 识别到官方 SDK 凭据输入界面，正在自动输入账号与密码...")
-            clean_btn = find_node_bounds(xml, resource_id="hg_login_view_button_clean_input_account")
-            if clean_btn:
-                tap_screen(*clean_btn)
-                time.sleep(0.3)
-            tap_screen(*acc_box)
-            time.sleep(0.3)
-            # 彻底清空可能存在的残余字符
-            for _ in range(15):
-                keyevent_press(67)
-            input_text_safe(phone)
-            time.sleep(0.3)
-            keyevent_press(4)  # 关闭弹出软键盘
-            time.sleep(0.5)
-
-            # 聚焦密码输入框并输入
-            tap_screen(*pwd_box)
-            time.sleep(0.3)
-            for _ in range(25):
-                keyevent_press(67)
-            input_text_safe(password)
-            time.sleep(0.3)
-            keyevent_press(4)  # 关闭弹出软键盘
-            time.sleep(0.5)
-
-            # 勾选用户协议
-            xml_cur = dump_ui_xml()
-            agree_cb = find_node_bounds(xml_cur, resource_id="hg_login_view_check_box_check_agreement")
-            if agree_cb:
-                tap_screen(*agree_cb)
-            else:
-                tap_screen(450, 438)
-            time.sleep(0.3)
-
-            # 点击登录
-            login_btn = find_node_bounds(xml_cur, resource_id="hg_login_view_button_password_login")
-            if login_btn:
-                tap_screen(*login_btn)
-            else:
-                tap_screen(640, 517)
-
-            print("[+] 凭据提交完成，正在等待服务器认证与 Token 下发...")
-            login_submitted = True
-            time.sleep(6)
-            continue
-
-        # 2. 账号管理弹窗中点击“登录其他账号”
-        other_btn = find_node_bounds(xml, resource_id="hg_login_view_button_other_login") or find_node_bounds(xml, text="登录其他账号", exact=True)
-        if other_btn and not login_submitted:
-            print("[+] 点击【登录其他账号】...")
-            tap_screen(*other_btn)
-            time.sleep(1)
-            continue
-
-        # 3. 验证码页面切换为“密码登录”
-        use_pwd_btn = find_node_bounds(xml, resource_id="hg_login_view_button_use_password_login") or find_node_bounds(xml, text="密码登录", exact=True)
-        if use_pwd_btn and not login_submitted:
-            print("[+] 切换为【密码登录】模式...")
-            tap_screen(*use_pwd_btn)
-            time.sleep(1)
-            continue
-
-        # 4. 如果已经提交登录，检测是否已登录成功并拉取归档
-        if login_submitted:
-            if find_node_bounds(xml, text="活动公告") or find_node_bounds(xml, text="系统公告"):
-                print("[+] 检测到登录公告，关闭公告窗口...")
-                tap_screen(940, 104)
-                time.sleep(2)
-
-            chk = subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"cat /data/data/{pkg}/shared_prefs/HypergryphSdkPreferences.xml 2>/dev/null || true"], stdout=subprocess.PIPE, text=True)
-            if "USER_CACHE" in chk.stdout and (phone[-4:] in chk.stdout if len(phone)>=4 else True):
-                print(f"[✔] 账号 [{acc_name}] 认证成功！正在导出 Session 会话存档...")
-                time.sleep(2)
-                target_dir = PROFILES_DIR / acc_id / "shared_prefs"
-                target_dir.mkdir(parents=True, exist_ok=True)
-                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "pull", f"/data/data/{pkg}/shared_prefs/.", str(target_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                sanitize_profile_sdk_prefs(target_dir / "HypergryphSdkPreferences.xml", phone_masked)
-                (PROFILES_DIR / "current_profile.txt").write_text(acc_id)
-                print(f"[✔] 账号 [{acc_name}] 专属会话存档建立完成！后续调度将享受 2 秒无感热换。")
-                return True
-
-        # 5. 若在封面，点击右下角“账号管理”唤起 SDK 对话框
-        if not login_submitted and not pwd_box:
-            tap_screen(923, 662)
-
-    print(f"[!] 账号 [{acc_name}] 自动登录超时，请确认账号密码是否正确。")
-    return False
-
-    print(f"[!] 账号 [{acc_name}] 自动登录超时，请确认账号密码是否正确。")
-    return False
-
 def switch_game_profile(account_or_id):
+    """
+    【MAA 原生触屏账号切换】— 不再读写/注入任何游戏配置文件，也无需账密。
+
+    原理: 设备上可存在多个已登录账号(游戏账号管理列表)。MAA 的 StartUp 任务
+    支持通过 account_name (登录名唯一子串，官服填尾号) 触屏点击切换到目标账号。
+    因此这里不再做本地存档注入，仅做一次「账号上下文校验/提示」：
+      - 目标账号有可用的切换标识(尾号) -> 交由 MAA StartUp.account_name 触屏切换；
+      - 无标识则沿用设备当前已登录账号 (首次需用户手动触屏登录一次)。
+    """
     if not account_or_id:
-        return
+        return False
     if isinstance(account_or_id, dict):
         account = account_or_id
-        target_acc_id = account.get("id")
     else:
-        target_acc_id = account_or_id
-        account = get_account_by_id(target_acc_id)
-        if not account:
-            account = {"id": target_acc_id, "name": target_acc_id}
+        account = get_account_by_id(account_or_id) or {"id": account_or_id, "name": account_or_id}
 
+    global _NEED_ACCOUNT_SWITCH
     acc_name = account.get("name", "未命名账号")
-    pkg = "com.bilibili.arknights" if account.get("platform") == "Bilibili" else "com.hypergryph.arknights"
-    target_phone = str(account.get("account_name", "")).strip()
-    target_masked = f"{target_phone[:3]}****{target_phone[-4:]}" if len(target_phone) >= 7 else target_phone
+    key = get_account_switch_key(account)
+    if not key:
+        _NEED_ACCOUNT_SWITCH = False
+        print(f"[!] 账号 [{acc_name}] 未设置切换标识(尾号)，将沿用设备当前已登录账号；如需切换请在网页端补充账号标识。")
+        return True
 
-    ensure_adb_root()
-
+    # 只读探测设备当前登录账号，决定是否需要触屏切换。
+    # 关键：仅在「明确探测到不同账号」时才请求 MAA 触屏切换；
+    # 探测不到 (''，会话不可读/未登录) 时一律不切换 —— 否则 MAA 的
+    # AccountSwitchTask 会反复重启客户端寻找账号管理界面，产生大量孤儿进程直至 OOM。
+    # 读应用私有 prefs 需要 adb root，先确保提权再探测。
     try:
-        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-        target_prof = PROFILES_DIR / target_acc_id / "shared_prefs"
-        state_file = PROFILES_DIR / "current_profile.txt"
-
-        # 1. 严格检查设备当前真实生效的账号手机号 (绝不盲信本地文本文件)
-        device_phone = get_device_active_account_phone(pkg)
-
-        # 2. 安全备份上一账号：仅当设备当前账号与某合法账号完全匹配且非目标账号时才允许落盘
-        if device_phone and device_phone != target_masked:
-            for other_acc in db.list_accounts():
-                o_phone = str(other_acc.get("account_name", "")).strip()
-                o_masked = f"{o_phone[:3]}****{o_phone[-4:]}" if len(o_phone) >= 7 else o_phone
-                if o_masked == device_phone:
-                    other_dir = PROFILES_DIR / other_acc["id"] / "shared_prefs"
-                    other_dir.mkdir(parents=True, exist_ok=True)
-                    subprocess.run([ADB_BIN, "-s", ADB_TARGET, "pull", f"/data/data/{pkg}/shared_prefs/.", str(other_dir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    sanitize_profile_sdk_prefs(other_dir / "HypergryphSdkPreferences.xml", o_masked)
-                    print(f"[+] 设备原账号 [{other_acc.get('name')}] ({device_phone}) 最新会话已校验归档并纯净化。")
-                    break
-
-        # 3. 检查设备当前是否已经完全处于目标账号环境
-        if device_phone == target_masked and target_prof.exists():
-            print(f"[+] 设备环境经底层实时校验已匹配目标账号: [{acc_name}] ({device_phone})")
-            state_file.write_text(target_acc_id)
-            return
-
-        print(f"[*] 正在为任务环境切换至目标账号: [{acc_name}] (ID: {target_acc_id})...")
-
-        # 4. 停止客户端
-        subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "am", "force-stop", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-
-        # 5. 校验目标账号本地存档完整性
-        has_valid_profile = False
-        if target_prof.exists():
-            sdk_pref_file = target_prof / "HypergryphSdkPreferences.xml"
-            if sdk_pref_file.exists():
-                sanitize_profile_sdk_prefs(sdk_pref_file, target_masked)
-                txt_sdk = sdk_pref_file.read_text(encoding="utf-8", errors="ignore")
-                if target_masked in txt_sdk:
-                    has_valid_profile = True
-                else:
-                    print(f"[!] 账号 [{acc_name}] 本地 SDK 存档未包含目标手机号，判定为失效。")
-            else:
-                pref_file = target_prof / "com.hypergryph.arknights.v2.playerprefs.xml"
-                if pref_file.exists() and target_masked in pref_file.read_text(encoding="utf-8", errors="ignore"):
-                    has_valid_profile = True
-
-        # 6. 若有有效存档，全量推入
-        if has_valid_profile:
-            print(f"[+] 正在装载账号 [{acc_name}] 的独立会话存档...")
-            # 关键：先清空设备旧缓存，杜绝双账号文件混合污染
-            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"rm -rf /data/data/{pkg}/shared_prefs/*"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "push", f"{str(target_prof)}/.", f"/data/data/{pkg}/shared_prefs/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # 关键：修复应用 UID 属主与权限
-            uid = get_app_uid(pkg)
-            subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", f"chown -R {uid}:{uid} /data/data/{pkg}/shared_prefs/ && chmod -R 777 /data/data/{pkg}/shared_prefs/"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # 注入后复验
-            recheck = get_device_active_account_phone(pkg)
-            if recheck == target_masked:
-                state_file.write_text(target_acc_id)
-                print(f"[✔] 账号 [{acc_name}] 独立环境加载与校验完成 ({recheck})！")
-                return
-            else:
-                print(f"[!] 注入后校验未达预期 (设备: {recheck}, 期望: {target_masked})，转入自动登录...")
-
-        # 7. 若无有效本地会话，启动自动登入
-        print(f"[*] 账号 [{acc_name}] 启动全自动账密登入及存档初始化...")
-        success = auto_login_arknights(account)
-        if not success:
-            print(f"[!] 账号 [{acc_name}] 自动登录未达预期，尝试以常规唤醒模式继续...")
-    except Exception as e:
-        print(f"[!] 切换账号登录环境跳过: {e}")
+        ensure_adb_root()
+    except Exception:
+        pass
+    cur_key = get_device_active_account_key()
+    if not cur_key:
+        _NEED_ACCOUNT_SWITCH = False
+        print(f"[!] 无法读取设备当前登录账号 (可能未登录/会话已失效)，本次不触发触屏切换，"
+              f"将直接以设备现状运行；如需切换请先在网页端手动触屏登录目标账号 [{acc_name}]。")
+    elif cur_key == key:
+        _NEED_ACCOUNT_SWITCH = False
+        print(f"[+] 设备当前已登录目标账号 [{acc_name}] (尾号 {key})，无需切换。")
+    else:
+        _NEED_ACCOUNT_SWITCH = True
+        print(f"[+] 检测到设备当前账号(尾号 {cur_key}) 与目标账号 [{acc_name}] (尾号 {key}) 不同，"
+              f"将由 MAA StartUp 触屏切换已登录账号。")
+    # 触屏切换交由 MAA StartUp 完成，这里恒返回 True（切换失败由 MAA 任务链反馈）
+    return True
 
 def run_task(task_type="daily", extra_args=None):
     global CURRENT_ACCOUNT_DATA
@@ -1030,6 +1022,28 @@ def run_task(task_type="daily", extra_args=None):
     mark_running_task(account, True)
 
     try:
+        # 鹰角官方服状态前置自检 (维护停服跳过 / 强制大更先行)
+        if account.get("platform", "Official") == "Official":
+            guard = hypergryph_guard.preflight_check(ADB_BIN, ADB_TARGET)
+            if guard.get("is_maintenance"):
+                print(f"[!] {guard['reason']}，安全跳过本次挂机任务！")
+                try:
+                    notifier.dispatch_account_notify(account, "【明日方舟托管跳过】官方维护中", f"### 官方服务器停服维护中\n- **原因**: {guard['reason']}\n- **状态**: 自动跳过当前挂机时段，待开服后恢复执行", event_type="on_daily_summary")
+                except Exception:
+                    pass
+                return True
+            if guard.get("need_update"):
+                print(f"[!] {guard['reason']}，正在先触发官方大版本覆盖升级...")
+                subprocess.run(["bash", str(BIN_DIR / "update_arknights.sh")])
+
+        # 启动前先彻底清理上一次可能残留的游戏进程 (防止 OOM 黑屏闪退)
+        _pkg_pre = "com.bilibili.arknights" if account.get("platform") == "Bilibili" else "com.hypergryph.arknights"
+        try:
+            force_kill_arknights(_pkg_pre)
+        except Exception:
+            pass
+
+        # 账号切换采用 MAA 原生触屏方式 (StartUp.account_name)，不读写任何配置文件
         switch_game_profile(account)
         acc_name = account.get("name", "默认账号")
         print(f"[*] 启动任务: {task_type} · 目标账号: [{acc_name}] (ID: {account.get('id')})")
@@ -1050,7 +1064,7 @@ def run_task(task_type="daily", extra_args=None):
         print(f"[*] 正在连接 ADB ({ADB_TARGET})...")
         if not asst.connect(ADB_BIN, ADB_TARGET):
             print("[*] ADB 未直连，尝试自动唤醒模拟器容器...")
-            subprocess.run(["docker", "compose", "-f", str(COMPOSE_FILE), "up", "-d"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(compose_cmd("up", "-d", "redroid"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(5)
             subprocess.run([ADB_BIN, "connect", ADB_TARGET], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not asst.connect(ADB_BIN, ADB_TARGET):
@@ -1058,15 +1072,293 @@ def run_task(task_type="daily", extra_args=None):
                 return False
     
         print(f"[+] ADB 连接就绪，配置任务队列: {task_type}")
-    
-        if task_type == "daily":
+
+        # 校准时区为北京时间 (redroid 默认 GMT，会导致游戏内时间错位 8 小时)
+        try:
+            tz = subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "getprop", "persist.sys.timezone"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5).stdout.strip()
+            if tz != "Asia/Shanghai":
+                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "setprop", "persist.sys.timezone", "Asia/Shanghai"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                subprocess.run([ADB_BIN, "-s", ADB_TARGET, "shell", "setprop", "ro.boot.timezone", "Asia/Shanghai"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                print("[+] 已将模拟器时区校准为 Asia/Shanghai。")
+        except Exception:
+            pass
+
+        # 检查该账号是否具备 MAA 桌面版协议 TaskQueue
+        custom_task_queue = None
+        maa_cfg_record = db.get_maa_config(account.get("id"))
+        if maa_cfg_record and isinstance(maa_cfg_record.get("config"), dict):
+            q = maa_cfg_record["config"].get("TaskQueue")
+            if isinstance(q, list) and len(q) > 0:
+                custom_task_queue = q
+
+        if task_type in ("daily", "maa_queue") and custom_task_queue:
+            print(f"[+] 正在装配 MAA 桌面版 TaskQueue 任务队列 (共 {len(custom_task_queue)} 项)...")
+            platform = account.get("platform", "Official")
+            for t_item in custom_task_queue:
+                if not t_item.get("IsEnable", True):
+                    continue
+                t_type = t_item.get("$type", "")
+
+                if t_type == "StartUpTask":
+                    # 【MAA 原生触屏账号切换】不读写任何游戏配置文件、无需账密。
+                    # 通过 account_name 传入目标账号尾号/标识，MAA 在设备已登录账号
+                    # 列表中触屏点击切换 (MAA 官方支持的 StartUp.account_name 能力)。
+                    su_params = {
+                        "client_type": t_item.get("ClientType", platform),
+                        "start_game_enabled": bool(t_item.get("StartGame", True))
+                    }
+                    switch_key = get_account_switch_key(account)
+                    # 优先用户显式配置的 AccountName，其次用账号自身标识尾号
+                    explicit = str(t_item.get("AccountName", "")).strip()
+                    account_switch_name = explicit or switch_key
+                    # 仅当设备当前不是目标账号时才触屏切换；已在目标账号则跳过切换，
+                    # 避免 MAA AccountSwitchTask 反复找不到账号管理界面而失败。
+                    if account_switch_name and _NEED_ACCOUNT_SWITCH:
+                        su_params["account_name"] = account_switch_name
+                        print(f"[+] StartUp 触屏切换目标账号: {account_switch_name}")
+                    elif account_switch_name:
+                        print(f"[+] 设备已在目标账号 [{account_switch_name}]，跳过触屏切换。")
+                    asst.append_task("StartUp", su_params)
+
+                elif t_type == "RecruitTask":
+                    daily_limit = int(t_item.get("MaxTimes", 4))
+                    acc_id = account.get("id")
+                    cur_r_stats = db.update_account_recruit_progress(acc_id, 0)
+                    today_count = int(cur_r_stats.get("today_count", 0)) if cur_r_stats else 0
+                    remaining_quota = max(0, daily_limit - today_count)
+                    run_allowance = min(4, remaining_quota)
+
+                    # 官方默认：自动选择 3/4/5★ 干员，时长拉满；仅 6★ 由用户决定是否自动确认
+                    select_stars = [3, 4, 5]
+                    confirm_stars = [3, 4, 5]
+                    if t_item.get("Level6Choose", False):
+                        confirm_stars.append(6)
+
+                    r_params = {
+                        "refresh": bool(t_item.get("ForceRefresh", True)),
+                        "select": select_stars,
+                        "confirm": confirm_stars if run_allowance > 0 else [],
+                        "times": run_allowance if run_allowance > 0 else 0,
+                        "set_time": True,
+                        "level3_use_time": 540,
+                        "level4_use_time": 540,
+                        "extra_tags_mode": 0,
+                        "skip_robot": True,
+                        "expedite": False
+                    }
+                    asst.append_task("Recruit", r_params)
+
+                elif t_type == "AnnihilationTask":
+                    # 刷剿灭本质是特化的理智作战 (周计划门控)
+                    ws = t_item.get("WeeklySchedule", {})
+                    day_keys = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                    cur_day = day_keys[datetime.datetime.now().weekday()]
+                    if not ws.get(cur_day, False):
+                        print(f"[+] 任务 [刷剿灭] 周计划判定：今日 ({cur_day}) 不执行剿灭，安全跳过。")
+                        continue
+                    stage = str(t_item.get("Stage", "Annihilation")).strip() or "Annihilation"
+                    if stage == "Annihilation":
+                        # 防御性：先打当期剿灭；若当期不可用 (MAA 找不到剿灭入口即直接结束)，再由常驻龙门市区兜底
+                        print(f"[+] 装配剿灭任务: 当期剿灭 (不可用时回退常驻龙门市区 LungmenDowntown)")
+                        asst.append_task("Fight", {
+                            "stage": "Annihilation",
+                            "series": -1, "medicine": 0, "stone": 0,
+                            "expiring_medicine": 0, "report_to_penguin": False
+                        })
+                        asst.append_task("Fight", {
+                            "stage": "LungmenDowntown@Annihilation",
+                            "series": -1, "medicine": 0, "stone": 0,
+                            "expiring_medicine": 0, "report_to_penguin": False
+                        })
+                    else:
+                        print(f"[+] 装配剿灭任务: 指定常驻关卡 {stage}")
+                        asst.append_task("Fight", {
+                            "stage": stage,
+                            "series": -1, "medicine": 0, "stone": 0,
+                            "expiring_medicine": 0, "report_to_penguin": False
+                        })
+
+                elif t_type == "InfrastTask":
+                    mode_str = str(t_item.get("Mode", "Default"))
+                    drones_target = t_item.get("UsesOfDrones", "PureGold")
+                    dorm_threshold = float(t_item.get("DormThreshold", 50)) / 100.0
+
+                    # 设施列表排序与开关解析
+                    default_facilities = ["Mfg", "Trade", "Control", "Power", "Reception", "Office", "Dorm", "Processing", "Training"]
+                    room_list = t_item.get("RoomList", [])
+                    if room_list and isinstance(room_list, list):
+                        facility_targets = [r["Room"] for r in room_list if r.get("IsEnabled", True) and r.get("Room") in default_facilities]
+                    else:
+                        facility_targets = ["Mfg", "Trade", "Control", "Power", "Reception", "Office", "Dorm", "Processing"]
+
+                    if mode_str == "Rotation":
+                        # 队列轮换：跳过控制中枢/发电站/宿舍/办公室
+                        asst.append_task("Infrast", {
+                            "facility": facility_targets,
+                            "mode": 20000,
+                            "drones": drones_target,
+                            "threshold": dorm_threshold,
+                            "dorm_notstationed_enabled": False
+                        })
+                    elif mode_str == "Custom":
+                        # 自定义：读取用户导入的排班文件 (账号维度)
+                        fname = str(t_item.get("Filename", "")).strip()
+                        plan_file = resolve_infrast_file(fname, account_id=account.get("id"))
+                        if not plan_file or not os.path.exists(plan_file):
+                            print(f"[!] 自定义基建模式未找到排班文件 (Filename={fname or '空'})，自动回退为常规模式执行。")
+                            asst.append_task("Infrast", {
+                                "facility": facility_targets,
+                                "mode": 0,
+                                "drones": drones_target,
+                                "threshold": dorm_threshold,
+                                "replenish": bool(t_item.get("OriginiumShardAutoReplenishment", False)),
+                                "dorm_notstationed_enabled": bool(t_item.get("DormFilterNotStationed", True)),
+                                "dorm_trust_enabled": bool(t_item.get("DormTrustEnabled", True)),
+                                "reception_message_board": bool(t_item.get("ReceptionMessageBoard", True)),
+                                "reception_clue_exchange": bool(t_item.get("ReceptionClueExchange", True)),
+                                "reception_send_clue": bool(t_item.get("SendClue", True))
+                            })
+                        else:
+                            plan_idx = calculate_plan_index(plan_file)
+                            asst.append_task("Infrast", {
+                                "facility": facility_targets,
+                                "mode": 10000,
+                                "filename": plan_file,
+                                "plan_index": plan_idx,
+                                "drones": drones_target,
+                                "threshold": dorm_threshold,
+                                "replenish": bool(t_item.get("OriginiumShardAutoReplenishment", False)),
+                                "dorm_notstationed_enabled": bool(t_item.get("DormFilterNotStationed", True)),
+                                "dorm_trust_enabled": bool(t_item.get("DormTrustEnabled", True)),
+                                "reception_message_board": bool(t_item.get("ReceptionMessageBoard", True)),
+                                "reception_clue_exchange": bool(t_item.get("ReceptionClueExchange", True)),
+                                "reception_send_clue": bool(t_item.get("SendClue", True))
+                            })
+                    else:
+                        # 常规模式 (算法自动最优换班)
+                        asst.append_task("Infrast", {
+                            "facility": facility_targets,
+                            "mode": 0,
+                            "drones": drones_target,
+                            "threshold": dorm_threshold,
+                            "replenish": bool(t_item.get("OriginiumShardAutoReplenishment", False)),
+                            "dorm_notstationed_enabled": bool(t_item.get("DormFilterNotStationed", True)),
+                            "dorm_trust_enabled": bool(t_item.get("DormTrustEnabled", True)),
+                            "reception_message_board": bool(t_item.get("ReceptionMessageBoard", True)),
+                            "reception_clue_exchange": bool(t_item.get("ReceptionClueExchange", True)),
+                            "reception_send_clue": bool(t_item.get("SendClue", True))
+                        })
+
+                elif t_type == "FightTask":
+                    # 检查周计划
+                    if t_item.get("UseWeeklySchedule"):
+                        ws = t_item.get("WeeklySchedule", {})
+                        day_keys = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                        cur_day = day_keys[datetime.datetime.now().weekday()]
+                        if not ws.get(cur_day, True):
+                            print(f"[+] 任务 [{t_item.get('Name', '理智作战')}] 周计划判定：今日 ({cur_day}) 不在计划内，安全跳过。")
+                            continue
+
+                    stage_plan = t_item.get("StagePlan", [])
+                    if isinstance(stage_plan, str):
+                        stage_plan = [s.strip() for s in stage_plan.split(",") if s.strip()]
+                    if not stage_plan:
+                        stage_plan = [t_item.get("Stage", "1-7")]
+
+                    for stg in stage_plan:
+                        f_params = {
+                            "stage": stg,
+                            "series": int(t_item.get("Series", 0)),
+                            "medicine": int(t_item.get("MedicineCount", 0)) if t_item.get("UseMedicine") else 0,
+                            "stone": int(t_item.get("StoneCount", 0)) if t_item.get("UseStone") else 0,
+                            "expiring_medicine": 999 if t_item.get("UseExpiringMedicine", True) else 0,
+                            "report_to_penguin": False
+                        }
+                        asst.append_task("Fight", f_params)
+
+                elif t_type == "DepotMaintainTask":
+                    if t_item.get("UpdateDepot", True):
+                        asst.append_task("Depot")
+                    # 依据最近一次仓库识别缓存，仅对「实际缺口」安排作战 (对齐 MAA 库存保持语义)：
+                    #   need = 目标库存 - 当前持有；need<=0 直接跳过；need>0 只刷「缺口数量」而非绝对目标。
+                    # 避免把已达标的计划也全部空刷一遍。
+                    depot_cache = load_account_depot(account.get("id"))
+                    only_first = bool(t_item.get("OnlyFirstInsufficientPlan", True))
+                    planned = 0
+                    for p in t_item.get("PlanList", []):
+                        if not (p.get("Stage") and p.get("DropId")):
+                            continue
+                        target = int(p.get("DropCount", 0) or 0)
+                        have = int(depot_cache.get(str(p["DropId"]), 0) or 0)
+                        need = target - have
+                        if need <= 0:
+                            print(f"[+] 库存保持: 材料 {p['DropId']} 已有 {have} >= 目标 {target}，跳过 {p['Stage']}。")
+                            continue
+                        asst.append_task("Fight", {
+                            "stage": p["Stage"],
+                            "series": 0,
+                            "medicine": int(p.get("MedicineCount", 0)) if p.get("UseMedicine") else 0,
+                            "stone": int(p.get("StoneCount", 0)) if p.get("UseStone") else 0,
+                            "drops": {str(p["DropId"]): need},
+                            "report_to_penguin": False
+                        })
+                        print(f"[+] 库存保持: 材料 {p['DropId']} 缺口 {need} (目标 {target} / 现有 {have})，安排刷取 {p['Stage']}。")
+                        planned += 1
+                        if only_first:
+                            print("[+] 库存保持: 仅补足首个缺口计划 (OnlyFirstInsufficientPlan)，其余交由下次运行。")
+                            break
+                    if planned == 0:
+                        print("[+] 库存保持: 所有目标材料均已达标，本次无需安排供应链刷取。")
+
+                elif t_type == "MallTask":
+                    first_raw = t_item.get("FirstList") or t_item.get("BuyFirst", ["赤金", "招聘许可", "龙门币"])
+                    black_raw = t_item.get("BlackList") or t_item.get("Blacklist", ["碳", "家具", "加急许可"])
+                    if isinstance(first_raw, str):
+                        buy_first = [x.strip() for x in re.split(r"[:：;,；]+", first_raw) if x.strip()]
+                    else:
+                        buy_first = first_raw
+                    if isinstance(black_raw, str):
+                        blacklist = [x.strip() for x in re.split(r"[:：;,；]+", black_raw) if x.strip()]
+                    else:
+                        blacklist = black_raw
+
+                    asst.append_task("Mall", {
+                        "shopping": bool(t_item.get("Shopping", True)),
+                        "buy_first": buy_first,
+                        "blacklist": blacklist,
+                        "reserve_max_credit": bool(t_item.get("ReserveMaxCredit", True)),
+                        "only_buy_discount": bool(t_item.get("OnlyBuyDiscount", False)),
+                        "force_shopping_if_credit_full": bool(t_item.get("ShoppingIgnoreBlackListWhenFull", False)),
+                        "visit_friends": bool(t_item.get("VisitFriends", True)),
+                        "credit_fight": bool(t_item.get("CreditFight", False)),
+                        "formation_index": int(t_item.get("CreditFightFormation", 0))
+                    })
+
+                elif t_type == "AwardTask":
+                    asst.append_task("Award", {
+                        "award": bool(t_item.get("Award", True)),
+                        "mail": bool(t_item.get("Mail", True)),
+                        "recruit": bool(t_item.get("FreeGacha", True)),
+                        "orundum": bool(t_item.get("Orundum", True)),
+                        "mining": bool(t_item.get("Mining", True)),
+                        "specialaccess": bool(t_item.get("SpecialAccess", True))
+                    })
+
+                elif t_type == "UserDataUpdateTask":
+                    if t_item.get("UpdateDepot", True):
+                        asst.append_task("Depot")
+                    if t_item.get("UpdateOperBox", True):
+                        asst.append_task("OperBox")
+
+        elif task_type == "daily":
             infrast_cfg = account.get("infrast", {})
             fight_cfg = account.get("fight", {})
             recruit_cfg = account.get("recruit", {})
             mall_cfg = account.get("mall", {})
             award_cfg = account.get("award", {})
     
-            infrast_file = resolve_infrast_file(infrast_cfg.get("plan_file", "default_plan.json"))
+            infrast_file = resolve_infrast_file(infrast_cfg.get("plan_file", ""), account_id=account.get("id"))
             plan_idx = calculate_plan_index(infrast_file)
             print(f"[+] 基建排班表: {infrast_file}, 启用班次: {plan_idx}")
     
@@ -1233,7 +1525,7 @@ def run_task(task_type="daily", extra_args=None):
             })
     
         elif task_type == "infrast":
-            infrast_file = resolve_infrast_file(account.get("infrast", {}).get("plan_file", "default_plan.json"))
+            infrast_file = resolve_infrast_file(account.get("infrast", {}).get("plan_file", ""), account_id=account.get("id"))
             plan_idx = calculate_plan_index(infrast_file)
             asst.append_task("StartUp", {"client_type": account.get("platform", "Official"), "start_game_enabled": True})
             asst.append_task("Infrast", {
@@ -1269,6 +1561,69 @@ def run_task(task_type="daily", extra_args=None):
         elif task_type == "depot":
             asst.append_task("StartUp", {"client_type": account.get("platform", "Official"), "start_game_enabled": True})
             asst.append_task("Depot")
+
+        elif task_type == "copilot":
+            # 自动战斗参数全部来自运行时入参，不落库 (1:1 对齐 MAA 行为)
+            use_list = bool(extra_args.get("use_copilot_list", False))
+            formation_on = bool(extra_args.get("formation", True))
+            formation_idx = int(extra_args.get("formation_index", 0) or 0)
+            support_usage = int(extra_args.get("support_unit_usage", 0))
+            add_tr = bool(extra_args.get("add_trust", False))
+            ignore_req = bool(extra_args.get("ignore_requirements", False))
+            user_add = extra_args.get("user_additional") or []
+            loop_times = int(extra_args.get("loop_times", 1) or 1)
+            use_pot = bool(extra_args.get("use_sanity_potion", False))
+
+            asst.append_task("StartUp", {"client_type": account.get("platform", "Official"), "start_game_enabled": True})
+
+            copilot_params = {
+                "formation": formation_on,
+                "support_unit_usage": support_usage,
+                "add_trust": add_tr,
+                "ignore_requirements": ignore_req,
+                "loop_times": loop_times,
+                "use_sanity_potion": use_pot
+            }
+            if formation_on and formation_idx > 0:
+                copilot_params["formation_index"] = formation_idx
+            if formation_on and isinstance(user_add, list) and user_add:
+                copilot_params["user_additional"] = [
+                    {"name": op.get("Name") or op.get("name"), "skill": int(op.get("Skill") or op.get("skill", 1))}
+                    for op in user_add if (op.get("Name") or op.get("name"))
+                ]
+
+            if use_list:
+                # 多作业模式：copilot_list 连续执行
+                raw_list = extra_args.get("copilot_list") or []
+                multi = []
+                for item in raw_list:
+                    fn = item.get("filename") or ""
+                    resolved = resolve_copilot_file(fn, account.get("owner_username"))
+                    if resolved and os.path.exists(resolved):
+                        mt = {"filename": resolved}
+                        if item.get("stage_name"):
+                            mt["stage_name"] = item["stage_name"]
+                        if item.get("is_raid"):
+                            mt["is_raid"] = True
+                        multi.append(mt)
+                    else:
+                        print(f"[!] 多作业模式跳过缺失文件: {fn}")
+                if not multi:
+                    print("[!] 错误: 多作业模式无有效作业文件，任务中止。")
+                    return False
+                copilot_params.pop("loop_times", None)  # 多作业模式不使用 loop_times
+                copilot_params["copilot_list"] = multi
+                print(f"[+] 装配 Copilot 多作业模式 (共 {len(multi)} 个作业)")
+            else:
+                cop_file = extra_args.get("copilot_file") or extra_args.get("stage") or ""
+                resolved_copilot = resolve_copilot_file(cop_file, account.get("owner_username"))
+                if not resolved_copilot or not os.path.exists(resolved_copilot):
+                    print(f"[!] 错误: Copilot 作业文件不存在: {cop_file} (解析: {resolved_copilot})")
+                    return False
+                copilot_params["filename"] = resolved_copilot
+                print(f"[+] 装配 Copilot 自动战斗任务: {resolved_copilot}")
+
+            asst.append_task("Copilot", copilot_params)
     
         else:
             print(f"[!] 未知任务类型: {task_type}")
@@ -1281,7 +1636,28 @@ def run_task(task_type="daily", extra_args=None):
     
         print("[*] 开始启动 MAA 任务链...")
         asst.start()
-    
+
+        # 后台进程守护线程：高频清理游离孤儿 + 重复主进程治理，防止 OOM
+        _reap_stop = threading.Event()
+        def _reaper_loop():
+            while not _reap_stop.wait(8):
+                try:
+                    reap_orphan_arknights(pkg)
+                except Exception:
+                    pass
+                # 硬保护：以「裸名主进程数量」判定重复启动 (正常应为 1)。
+                # 若 >1，说明发生了重复拉起 (账户切换失败/守护重启)，清理旧副本防 OOM。
+                # 不再以进程总数判定 —— 正常的多进程架构本就可能达 4~5 个。
+                try:
+                    mains = count_arknights_mains(pkg)
+                    if mains > 1:
+                        print(f"[!] 检测到重复方舟主进程 {mains} 个 (疑似重复启动)，执行主进程治理以防 OOM。", flush=True)
+                        reap_orphan_arknights(pkg)
+                except Exception:
+                    pass
+        _reaper = threading.Thread(target=_reaper_loop, daemon=True)
+        _reaper.start()
+
         while asst.running():
             # 收到终止信号（被顶号 / 班次超时）立即中止，不等任务自然跑完
             if _KICKED_OUT:
@@ -1292,6 +1668,8 @@ def run_task(task_type="daily", extra_args=None):
                     pass
                 break
             time.sleep(2)
+
+        _reap_stop.set()
     
         if _KICKED_OUT:
             print("[✗] 本次班次判定为【被顶号 / 超时】，任务放弃（未完成，不作完成简报）。")
@@ -1345,7 +1723,15 @@ if __name__ == "__main__":
     if len(sys.argv) > 2:
         extra["account_id"] = sys.argv[2]
     if len(sys.argv) > 3:
-        extra["stage"] = sys.argv[3]
+        arg3 = sys.argv[3]
+        if arg3.startswith("{") and arg3.endswith("}"):
+            try:
+                extra.update(json.loads(arg3))
+            except Exception:
+                extra["stage"] = arg3
+        else:
+            extra["stage"] = arg3
+            extra["copilot_file"] = arg3
 
     success = run_task(t_type, extra)
     sys.exit(0 if success else 1)
