@@ -131,6 +131,17 @@ def get_account_oper_box_file(acc_id):
 def get_account_6star_event_file(acc_id):
     return get_account_dir(acc_id) / "recruit_6star_event.json"
 
+def normalize_switch_key(raw):
+    """
+    将用户/账号记录中的切换标识归一化为 MAA 可用的匹配串：
+    官服取纯数字尾号 (末 4 位)；非数字标识 (如 B 服用户名) 原样返回。
+    """
+    raw = str(raw or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 4:
+        return digits[-4:]
+    return raw
+
 def get_account_switch_key(account):
     """
     计算用于 MAA 触屏账号切换 (StartUp.account_name) 的匹配标识。
@@ -138,11 +149,7 @@ def get_account_switch_key(account):
       官服: 输入尾号(如 4567) 即可匹配 123****4567
     这里优先用纯数字尾号；账号标识本身非数字 (如 B 服的 用户名) 则原样返回。
     """
-    raw = str(account.get("account_name", "") or "").strip()
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) >= 4:
-        return digits[-4:]
-    return raw
+    return normalize_switch_key(account.get("account_name", ""))
 
 def get_device_active_account_key(pkg="com.hypergryph.arknights"):
     """
@@ -970,7 +977,7 @@ def guard_game_startup(pkg, platform):
 
     return True
 
-def switch_game_profile(account_or_id):
+def switch_game_profile(account_or_id, explicit_switch_key=None):
     """
     【MAA 原生触屏账号切换】— 不再读写/注入任何游戏配置文件，也无需账密。
 
@@ -979,6 +986,9 @@ def switch_game_profile(account_or_id):
     因此这里不再做本地存档注入，仅做一次「账号上下文校验/提示」：
       - 目标账号有可用的切换标识(尾号) -> 交由 MAA StartUp.account_name 触屏切换；
       - 无标识则沿用设备当前已登录账号 (首次需用户手动触屏登录一次)。
+
+    explicit_switch_key: 用户在网页端 StartUpTask 内显式填写的「切换账号尾号」，
+    优先级高于账号记录自带的 account_name 标识。
     """
     if not account_or_id:
         return False
@@ -989,7 +999,7 @@ def switch_game_profile(account_or_id):
 
     global _NEED_ACCOUNT_SWITCH
     acc_name = account.get("name", "未命名账号")
-    key = get_account_switch_key(account)
+    key = normalize_switch_key(explicit_switch_key) or get_account_switch_key(account)
     if not key:
         _NEED_ACCOUNT_SWITCH = False
         print(f"[!] 账号 [{acc_name}] 未设置切换标识(尾号)，将沿用设备当前已登录账号；如需切换请在网页端补充账号标识。")
@@ -1112,8 +1122,24 @@ def run_task(task_type="daily", extra_args=None):
         except Exception:
             pass
 
+        # 该账号是否具备 MAA 桌面版协议 TaskQueue (提前读取，供账号切换判定使用)
+        custom_task_queue = None
+        maa_cfg_record = db.get_maa_config(account.get("id"))
+        if maa_cfg_record and isinstance(maa_cfg_record.get("config"), dict):
+            q = maa_cfg_record["config"].get("TaskQueue")
+            if isinstance(q, list) and len(q) > 0:
+                custom_task_queue = q
+
+        # 用户在网页端 StartUpTask 内显式填写的「切换账号尾号」(优先于账号记录标识)
+        explicit_switch_key = ""
+        if custom_task_queue:
+            for _t in custom_task_queue:
+                if _t.get("$type") == "StartUpTask":
+                    explicit_switch_key = str(_t.get("AccountName", "") or "").strip()
+                    break
+
         # 账号切换采用 MAA 原生触屏方式 (StartUp.account_name)，不读写任何配置文件
-        switch_game_profile(account)
+        switch_game_profile(account, explicit_switch_key=explicit_switch_key)
         acc_name = account.get("name", "默认账号")
         print(f"[*] 启动任务: {task_type} · 目标账号: [{acc_name}] (ID: {account.get('id')})")
 
@@ -1158,14 +1184,7 @@ def run_task(task_type="daily", extra_args=None):
         except Exception:
             pass
 
-        # 检查该账号是否具备 MAA 桌面版协议 TaskQueue
-        custom_task_queue = None
-        maa_cfg_record = db.get_maa_config(account.get("id"))
-        if maa_cfg_record and isinstance(maa_cfg_record.get("config"), dict):
-            q = maa_cfg_record["config"].get("TaskQueue")
-            if isinstance(q, list) and len(q) > 0:
-                custom_task_queue = q
-
+        # 检查该账号是否具备 MAA 桌面版协议 TaskQueue (上面已提前读取)
         if task_type in ("daily", "maa_queue") and custom_task_queue:
             print(f"[+] 正在装配 MAA 桌面版 TaskQueue 任务队列 (共 {len(custom_task_queue)} 项)...")
             platform = account.get("platform", "Official")
@@ -1185,7 +1204,7 @@ def run_task(task_type="daily", extra_args=None):
                     switch_key = get_account_switch_key(account)
                     # 优先用户显式配置的 AccountName，其次用账号自身标识尾号
                     explicit = str(t_item.get("AccountName", "")).strip()
-                    account_switch_name = explicit or switch_key
+                    account_switch_name = normalize_switch_key(explicit) or switch_key
                     # 仅当设备当前不是目标账号时才触屏切换；已在目标账号则跳过切换，
                     # 避免 MAA AccountSwitchTask 反复找不到账号管理界面而失败。
                     if account_switch_name and _NEED_ACCOUNT_SWITCH:
