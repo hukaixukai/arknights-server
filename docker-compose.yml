@@ -1,3 +1,4 @@
+name: arknights
 services:
   redroid:
     image: erstt/redroid:11.0.0_ndk_ChromeOS
@@ -7,7 +8,7 @@ services:
     ports:
       - "127.0.0.1:5555:5555"
     volumes:
-      - ./data:/data
+      - /srv/docker/volumes/arknights/data:/data
       - /dev/binderfs:/dev/binderfs
     devices:
       - /dev/dri/card0:/dev/dri/card0
@@ -19,4 +20,23 @@ services:
       - androidboot.redroid_fps=30
       - androidboot.use_memfd=1
       - androidboot.redroid_gpu_mode=host
+      - androidboot.redroid_timezone=Asia/Shanghai
       - ro.sf.lcd_density=240
+
+  ark_manager:
+    image: arknights-manager:latest
+    container_name: ark_web_touch
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    working_dir: /app
+    entrypoint: ["/app/entrypoint.sh"]
+    environment:
+      - PORT=8090
+      - ADB_BIN=/usr/bin/adb
+      - ADB_TARGET=127.0.0.1:5555
+      - ARK_BASE_DIR=/app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/docker/containers/arknights:/app:rw
+      - /srv/docker/volumes/arknights/data:/app/data:rw

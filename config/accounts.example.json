@@ -5,7 +5,6 @@
       "id": "acc_example_001",
       "name": "我的方舟账号",
       "account_name": "13800000000",
-      "game_password": "your_game_password_here",
       "platform": "Official",
       "enabled": true,
       "owner_username": "admin",

@@ -171,7 +171,7 @@ def get_device_active_account_key(pkg="com.hypergryph.arknights"):
                 return digits[-4:] if len(digits) >= 4 else digits
     except Exception:
         pass
-    # 回退：游戏 playerprefs 记录的用户名 (如 130****8019)
+    # 回退：游戏 playerprefs 记录的用户名 (如 138****0000)
     try:
         res2 = subprocess.run(
             [ADB_BIN, "-s", ADB_TARGET, "shell",

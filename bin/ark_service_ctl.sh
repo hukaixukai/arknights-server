@@ -1,13 +1,12 @@
 #!/bin/bash
-set -e
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -d "/app/bin" ]; then BASE_DIR="/app"; else BASE_DIR="${ARK_BASE_DIR:-/srv/docker/containers/arknights}"; fi
 MAA_DIR="$BASE_DIR/maa"
 BIN_DIR="$BASE_DIR/bin"
-ADB="${ADB_BIN:-$(which adb 2>/dev/null || echo "$HOME/.local/bin/adb")}"
+ADB="$(which adb 2>/dev/null || echo /usr/bin/adb)"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 
-# 确保 binderfs 内核驱动就绪 (仅用于 ReDroid 安卓底层通信)
+# 确保 binderfs 内核驱动就绪 (仅用于 ReDroid 安卓底层通信，不触碰任何 Web 网页)
 ensure_binderfs() {
     if [ ! -c /dev/binderfs/binder-control ]; then
         echo "[+] 正在初始化 binderfs 驱动..."
@@ -20,17 +19,30 @@ ensure_binderfs() {
     fi
 }
 
-# 启动模拟器 (纯后台托管)
+# 启动模拟器 (纯后台托管，绝不自动开启 Web 投屏)
 start_emu() {
     echo "[*] 正在启动安卓模拟器 (ReDroid)..."
     ensure_binderfs
-    docker compose -f "$COMPOSE_FILE" up -d
+    docker compose -p arknights -f "$COMPOSE_FILE" up -d redroid
 
     echo "[+] 等待安卓系统启动并连接 ADB (127.0.0.1:5555)..."
-    local max_retry=30
+    local max_retry=40
     local count=0
+    local adbd_restarted=false
     while [ $count -lt $max_retry ]; do
+        "$ADB" disconnect 127.0.0.1:5555 >/dev/null 2>&1 || true
         "$ADB" connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+        local dev_state=""
+        dev_state=$("$ADB" -s 127.0.0.1:5555 get-state 2>/dev/null | tr -d '\r\n')
+        # 处理 recreate 后常见的 device offline：重启容器内 adbd 并重连
+        if [ "$dev_state" != "device" ] && [ "$adbd_restarted" = false ] && [ $count -ge 6 ]; then
+            echo "[!] ADB 设备离线，正在重启模拟器内 adbd 守护..."
+            docker exec redroid_arknights sh -c "setprop service.adb.tcp.port 5555; stop adbd; start adbd" >/dev/null 2>&1 || true
+            adbd_restarted=true
+            sleep 4
+            "$ADB" disconnect 127.0.0.1:5555 >/dev/null 2>&1 || true
+            "$ADB" connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+        fi
         local boot_status=""
         boot_status=$("$ADB" -s 127.0.0.1:5555 shell getprop sys.boot_completed 2>/dev/null || true)
         boot_status=$(echo "$boot_status" | tr -d '\r\n')
@@ -39,6 +51,9 @@ start_emu() {
             "$ADB" -s 127.0.0.1:5555 root >/dev/null 2>&1 || true
             sleep 2
             "$ADB" connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+            # 强制校准时区为北京时间 (redroid 默认 GMT，会导致游戏内时间错位 8 小时)
+            "$ADB" -s 127.0.0.1:5555 shell "setprop persist.sys.timezone Asia/Shanghai" >/dev/null 2>&1 || true
+            "$ADB" -s 127.0.0.1:5555 shell "setprop ro.boot.timezone Asia/Shanghai" >/dev/null 2>&1 || true
             break
         fi
         sleep 2
@@ -46,10 +61,10 @@ start_emu() {
     done
 }
 
-# 停止模拟器以释放 CPU/内存
+# 停止模拟器以释放 CPU/内存 (不影响 Workbench Web 服务状态)
 stop_emu() {
     echo "[*] 正在关闭安卓模拟器以释放 CPU/内存..."
-    docker compose -f "$COMPOSE_FILE" stop
+    docker compose -p arknights -f "$COMPOSE_FILE" stop redroid
     "$ADB" disconnect 127.0.0.1:5555 >/dev/null 2>&1 || true
     echo "[✔] 容器已停止，硬件资源完全释放。"
 }
@@ -72,6 +87,12 @@ show_status() {
     docker ps -a --filter "name=redroid_arknights" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
     echo "--- ADB 连接状态 ---"
     "$ADB" devices
+    echo "--- 方舟交互网页状态 (Workbench 独立卡片) ---"
+    if curl -s -m 2 http://127.0.0.1:8090/ >/dev/null 2>&1; then
+        echo "方舟交互网页 (8090): 开启 (用户在 Workbench 手动启用)"
+    else
+        echo "方舟交互网页 (8090): 已关闭 (平时默认关闭，保护隐私与端口安全)"
+    fi
     echo "--- 系统资源占用 ---"
     echo "CPU 负载: $(uptime | awk -F'load average:' '{print $2}')"
     free -h | grep -E 'Mem|内存'
@@ -91,51 +112,11 @@ run_pipeline() {
     local arg3="$3"
     local auto_stop=false
 
-    # 单班次统一执行时长上限（秒）。无论是否跑完，到点即终止。
-    local max_runtime="${ARK_TASK_MAX_SECONDS:-3600}"
-
     # 系统级排他锁，防止定时调度与手动并发启动
     exec 200>/tmp/ark_service_ctl.lock
     if ! flock -n 200; then
-        # 已有班次在跑：新班次不再放弃，而是礼貌地请旧班次让位。
-        # 这是设计行为——每个班次固定占用约一小时，到点必须交接给下一班。
-        echo "[!] 检测到上一班次尚未结束，正在请求其退出以让位给新班次..."
-
-        # 先向旧的 maa_runner 进程发送 SIGTERM，它会按“被顶号/超时”逻辑优雅收尾。
-        # 注意：调度锁由旧的 ark_service_ctl.sh 持有，旧脚本会在其 timeout 返回后释放锁；
-        # 因此这里不能只杀 Python 进程，还必须等待锁真正释放。
-        local old_pids
-        old_pids=$(pgrep -f "maa_runner.py" || true)
-        if [ -n "$old_pids" ]; then
-            echo "[*] 向旧任务进程发送 SIGTERM 请求优雅退出: $old_pids"
-            kill -TERM $old_pids 2>/dev/null || true
-        else
-            echo "[*] 未发现运行中的 MAA 进程，可能是残留锁，直接等待释放。"
-        fi
-
-        # 轮询等待旧班次释放调度锁（最长 90 秒）
-        local waited=0
-        local got_lock=false
-        while [ $waited -lt 90 ]; do
-            if flock -n 200; then
-                got_lock=true
-                break
-            fi
-            sleep 2
-            waited=$((waited + 2))
-        done
-
-        if [ "$got_lock" != true ]; then
-            # 超时仍拿不到锁，强制清理旧进程后做最后一次尝试
-            echo "[!] 等待 90 秒后旧班次仍未释放，执行强制终止。"
-            pkill -9 -f "maa_runner.py" 2>/dev/null || true
-            sleep 3
-            if ! flock -n 200; then
-                echo "[✗] 抢占失败，旧班次锁未释放，本次班次放弃执行（已记录日志）。"
-                return 0
-            fi
-        fi
-        echo "[✔] 旧班次已让位，新班次开始。"
+        echo "[!] 检测到已有任务流水线正在调度执行，为保障模拟器安全，本次触发放弃执行。"
+        return 0
     fi
 
     if ! docker ps --filter "name=redroid_arknights" --filter "status=running" | grep -q redroid_arknights; then
@@ -144,14 +125,11 @@ run_pipeline() {
         auto_stop=true
     fi
 
-    echo "[*] 启动 MAA 任务: $task_type $arg2 $arg3 (单班次上限 ${max_runtime}s)"
-    # timeout 语义: 到点先发 SIGTERM 请求优雅退出，15 秒后仍未退出则 SIGKILL。
-    # 收到超时信号通常意味着账号被顶号，maa_runner 会按“放弃”处理并记录日志。
-    timeout --preserve-status --kill-after=15s "${max_runtime}s" \
-        python3 -u "$BIN_DIR/maa_runner.py" "$task_type" "$arg2" "$arg3" || true
+    echo "[*] 启动 MAA 任务: $task_type $arg2 $arg3"
+    timeout --preserve-status --kill-after=15s 3000s python3 -u "$BIN_DIR/maa_runner.py" "$task_type" "$arg2" "$arg3" || true
 
     if [ "$auto_stop" = true ]; then
-        echo "[*] 任务已完成，按需停止模拟器以保护硬件资源..."
+        echo "[*] 任务已完成，按需停止模拟器以保护 J4105 资源..."
         stop_emu
     fi
     flock -u 200
@@ -188,8 +166,11 @@ case "$1" in
     run-fight)
         run_pipeline "fight" "$2" "$3"
         ;;
+    run-copilot)
+        echo "[!] 暂未配置独立 copilot 作业流"
+        ;;
     *)
-        echo "用法: $0 {start|stop|restart|status|start-game|run-daily|run-recruit|run-fight <stage>|update-maa|update-game}"
+        echo "用法: $0 {start|stop|restart|status|start-game|run-daily|run-recruit|run-fight <stage>|run-copilot <file>|update-maa|update-game}"
         exit 1
         ;;
 esac

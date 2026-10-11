@@ -9,6 +9,14 @@ import time
 import json
 import sqlite3
 import pathlib
+import datetime
+
+# 统一时区为北京时间 (游戏日 04:00 刷新以此为准)
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except Exception:
+    pass
 
 BASE_DIR = pathlib.Path(os.getenv("ARK_BASE_DIR", str(pathlib.Path(__file__).resolve().parent.parent)))
 CONFIG_DIR = BASE_DIR / "config"
@@ -85,10 +93,33 @@ def init_db():
             updated_at TEXT
         );
         """)
+
+        # 5. MAA 桌面版协议配置表 (按托管账号隔离绑定)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS maa_configs (
+            account_id TEXT PRIMARY KEY,
+            owner_username TEXT NOT NULL,
+            config_name TEXT DEFAULT 'Default',
+            config_json TEXT NOT NULL,
+            updated_at TEXT
+        );
+        """)
+
+        # 6. MAA 桌面版定时执行表 (40 分钟独占窗口)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS maa_timers (
+            account_id TEXT PRIMARY KEY,
+            owner_username TEXT NOT NULL,
+            timers_json TEXT NOT NULL,
+            window_minutes INTEGER DEFAULT 40,
+            updated_at TEXT
+        );
+        """)
         conn.commit()
 
-    # 尝试平滑无损迁移已有 JSON 数据
+    # 尝试平滑无损迁移已有 JSON 数据与初始化 MAA 默认配置
     migrate_from_json_if_needed()
+    ensure_maa_defaults_for_all_accounts()
 
 def migrate_from_json_if_needed():
     with get_connection() as conn:
@@ -170,8 +201,10 @@ def delete_user(username: str):
         return False, "系统超级管理员不可删除"
     with get_connection() as conn:
         conn.execute("DELETE FROM users WHERE username = ?", (username,))
-        # 级联删除该用户托管的全部方舟账号
+        # 级联删除该用户托管的全部方舟账号及 MAA 关联配置
         conn.execute("DELETE FROM accounts WHERE owner_username = ?", (username,))
+        conn.execute("DELETE FROM maa_configs WHERE owner_username = ?", (username,))
+        conn.execute("DELETE FROM maa_timers WHERE owner_username = ?", (username,))
         conn.commit()
     return True, f"已成功移除用户 [{username}] 及其名下所有托管账号"
 
@@ -195,7 +228,6 @@ def set_system_setting(key: str, value: str):
 # ==================== 方舟托管账号 DAO ====================
 
 def get_arknights_game_day():
-    import datetime
     now = datetime.datetime.now()
     if now.hour < 4:
         game_day = now.date() - datetime.timedelta(days=1)
@@ -308,7 +340,7 @@ def save_account(acc: dict):
             acc_id,
             acc.get("name", "未命名账号"),
             acc.get("account_name", ""),
-            acc.get("game_password", ""),
+            "",  # game_password: 系统不再保存任何游戏账密 (保留列以兼容旧库)
             acc.get("platform", "Official"),
             1 if acc.get("enabled", True) else 0,
             acc.get("owner_username", DEFAULT_ADMIN_USER),
@@ -326,6 +358,22 @@ def save_account(acc: dict):
             now_str
         ))
         conn.commit()
+
+    # 自动保证新账号拥有默认的 MAA 桌面版配置与定时
+    if not get_maa_config(acc_id):
+        try:
+            import maa_config_adapter
+            def_cfg = maa_config_adapter.get_default_maa_config(acc.get("account_name", ""))
+            save_maa_config(acc_id, acc.get("owner_username", DEFAULT_ADMIN_USER), def_cfg)
+        except Exception as e:
+            print(f"[DB] 初始化 MAA 默认配置跳过: {e}")
+    if not get_maa_timers(acc_id):
+        try:
+            import maa_config_adapter
+            def_timers = maa_config_adapter.get_default_maa_timers()
+            save_maa_timers(acc_id, acc.get("owner_username", DEFAULT_ADMIN_USER), def_timers, window_minutes=40)
+        except Exception as e:
+            print(f"[DB] 初始化 MAA 默认定时跳过: {e}")
 
     # 保持与历史 active_account_id 兼容
     curr_active = get_active_account_id()
@@ -353,6 +401,8 @@ def update_account_inventory_and_chips(acc_id: str, inventory_dict: dict, chips_
 def delete_account(acc_id: str):
     with get_connection() as conn:
         conn.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
+        conn.execute("DELETE FROM maa_configs WHERE account_id = ?", (acc_id,))
+        conn.execute("DELETE FROM maa_timers WHERE account_id = ?", (acc_id,))
         conn.commit()
     
     # 如果删除的是当前激活账号，自动切到下一个
@@ -363,22 +413,44 @@ def delete_account(acc_id: str):
         set_active_account_id(new_active)
     return True
 
-def get_active_account_id() -> str:
+def get_active_account_id(owner_username: str = None) -> str:
+    """
+    读取"当前激活的方舟账号"。
+    - 传入 owner_username 时：按用户维度隔离读取 (active_account_id:<user>)，
+      仅在该用户名下账号中取值，绝不串到他人账号。
+    - 不传时：读取全局 (兼容管理员与历史行为)。
+    """
+    key = "active_account_id" if not owner_username else f"active_account_id:{owner_username}"
     with get_connection() as conn:
+        if owner_username:
+            row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+            if row and row[0]:
+                # 校验该账号仍归属此用户，防止越权残留
+                chk = conn.execute("SELECT 1 FROM accounts WHERE id = ? AND owner_username = ?", (row[0], owner_username)).fetchone()
+                if chk:
+                    return row[0]
+            acc_row = conn.execute("SELECT id FROM accounts WHERE owner_username = ? ORDER BY id ASC LIMIT 1", (owner_username,)).fetchone()
+            return acc_row[0] if acc_row else ""
         row = conn.execute("SELECT value FROM system_state WHERE key = 'active_account_id'").fetchone()
         if row and row[0]:
             return row[0]
-        # 兜底返回第一个账号
-        acc_row = conn.execute("SELECT id FROM accounts LIMIT 1").fetchone()
+        acc_row = conn.execute("SELECT id FROM accounts ORDER BY id ASC LIMIT 1").fetchone()
         return acc_row[0] if acc_row else ""
 
-def set_active_account_id(acc_id: str):
+def set_active_account_id(acc_id: str, owner_username: str = None):
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    key = "active_account_id" if not owner_username else f"active_account_id:{owner_username}"
     with get_connection() as conn:
         conn.execute("""
         INSERT OR REPLACE INTO system_state (key, value, updated_at)
-        VALUES ('active_account_id', ?, ?)
-        """, (acc_id, now_str))
+        VALUES (?, ?, ?)
+        """, (key, acc_id, now_str))
+        # 同时维护全局值，兼容调度器与历史逻辑 (仅当未指定用户或为默认管理员时)
+        if not owner_username or owner_username == DEFAULT_ADMIN_USER:
+            conn.execute("""
+            INSERT OR REPLACE INTO system_state (key, value, updated_at)
+            VALUES ('active_account_id', ?, ?)
+            """, (acc_id, now_str))
         conn.commit()
     return True
 
@@ -405,7 +477,128 @@ def set_running_task(task_info: dict):
         conn.commit()
     return True
 
+# ==================== MAA 桌面版配置与定时执行 DAO ====================
+
+def get_maa_config(account_id: str):
+    if not account_id:
+        return None
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM maa_configs WHERE account_id = ?", (account_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["config"] = json.loads(d["config_json"])
+        except Exception:
+            d["config"] = {}
+        return d
+
+def save_maa_config(account_id: str, owner_username: str, config_dict: dict, config_name: str = "Default"):
+    if not account_id:
+        return False
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    conf_json = json.dumps(config_dict, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute("""
+        INSERT OR REPLACE INTO maa_configs (account_id, owner_username, config_name, config_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """, (account_id, owner_username or DEFAULT_ADMIN_USER, config_name or "Default", conf_json, now_str))
+        conn.commit()
+    return True
+
+def get_maa_timers(account_id: str):
+    if not account_id:
+        return None
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM maa_timers WHERE account_id = ?", (account_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["timers"] = json.loads(d["timers_json"])
+        except Exception:
+            d["timers"] = {}
+        return d
+
+def save_maa_timers(account_id: str, owner_username: str, timers_dict: dict, window_minutes: int = 40):
+    if not account_id:
+        return False
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    timers_json = json.dumps(timers_dict, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute("""
+        INSERT OR REPLACE INTO maa_timers (account_id, owner_username, timers_json, window_minutes, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """, (account_id, owner_username or DEFAULT_ADMIN_USER, timers_json, int(window_minutes), now_str))
+        conn.commit()
+    return True
+
+def list_all_maa_timers():
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT t.*, a.name AS account_name
+            FROM maa_timers t
+            LEFT JOIN accounts a ON t.account_id = a.id
+            ORDER BY t.account_id ASC
+        """).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["timers"] = json.loads(d["timers_json"])
+            except Exception:
+                d["timers"] = {}
+            result.append(d)
+        return result
+
+def ensure_maa_defaults_for_all_accounts():
+    try:
+        import maa_config_adapter
+    except Exception as e:
+        print(f"[DB] 导入 maa_config_adapter 失败: {e}")
+        return
+
+    accs = list_accounts()
+    for acc in accs:
+        acc_id = acc.get("id")
+        if not acc_id:
+            continue
+        owner = acc.get("owner_username") or DEFAULT_ADMIN_USER
+
+        existing_cfg = get_maa_config(acc_id)
+        if not existing_cfg:
+            def_cfg = maa_config_adapter.get_default_maa_config(acc.get("account_name", ""))
+            save_maa_config(acc_id, owner, def_cfg, config_name="Default")
+        else:
+            migrated = maa_config_adapter.migrate_legacy_config(existing_cfg.get("config", {}), acc.get("account_name", ""))
+            if migrated != existing_cfg.get("config"):
+                save_maa_config(acc_id, owner, migrated, config_name=existing_cfg.get("config_name", "Default"))
+
+        if not get_maa_timers(acc_id):
+            def_timers = maa_config_adapter.get_default_maa_timers()
+            hist_sched = acc.get("schedules") or []
+            if hist_sched and isinstance(hist_sched, list):
+                new_list = []
+                for idx, s in enumerate(hist_sched):
+                    try:
+                        p = str(s).strip().split(":")
+                        if len(p) == 2:
+                            new_list.append({
+                                "Id": idx,
+                                "IsEnabled": True,
+                                "Hour": int(p[0]),
+                                "Minute": int(p[1]),
+                                "Remark": f"班次{idx+1}"
+                            })
+                    except Exception:
+                        pass
+                if new_list:
+                    def_timers["List"] = new_list
+            save_maa_timers(acc_id, owner, def_timers, window_minutes=40)
+
+# 自动确保数据库表与默认记录就绪
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     print("SQLite 数据库初始化与测试完毕！当前用户列表:", list_users())
     print("账号列表:", list_accounts())

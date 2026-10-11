@@ -1,12 +1,12 @@
 #!/bin/bash
 set -o pipefail
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -d "/app" ]; then BASE_DIR="${ARK_BASE_DIR:-/app}"; else BASE_DIR="${ARK_BASE_DIR:-/srv/docker/containers/arknights}"; fi
 BIN_DIR="$BASE_DIR/bin"
 COMPOSE_FILE="$BASE_DIR/docker-compose.yml"
 APK_PATH="$BASE_DIR/arknights.apk"
-ADB="${ADB_BIN:-$(which adb 2>/dev/null || echo "$HOME/.local/bin/adb")}"
-DEVICE="${ADB_TARGET:-127.0.0.1:5555}"
+ADB="$(which adb 2>/dev/null || echo /usr/bin/adb)"
+DEVICE="127.0.0.1:5555"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -20,7 +20,7 @@ ensure_emu_running() {
     if ! docker ps --filter "name=redroid_arknights" --filter "status=running" | grep -q redroid_arknights; then
         log "[*] 检测到模拟器处于休眠状态，正在按需启动以检查官方服版本..."
         WAS_STOPPED=true
-        docker compose -f "$COMPOSE_FILE" up -d
+        docker compose -p arknights -f "$COMPOSE_FILE" up -d redroid
         local max_retry=30
         local count=0
         while [ $count -lt $max_retry ]; do
@@ -42,8 +42,8 @@ ensure_emu_running() {
 
 ensure_emu_cleanup() {
     if [ "$WAS_STOPPED" = true ]; then
-        log "[*] 检查/更新任务结束，将模拟器重新归位休眠以释放内存与 GPU..."
-        docker compose -f "$COMPOSE_FILE" stop >/dev/null 2>&1 || true
+        log "[*] 检查/更新任务结束，将模拟器重新归位休眠以释放 4GB+ 内存与 GPU..."
+        docker compose -p arknights -f "$COMPOSE_FILE" stop redroid >/dev/null 2>&1 || true
         "$ADB" disconnect "$DEVICE" >/dev/null 2>&1 || true
         log "[✔] 模拟器已安全休眠。"
     fi
@@ -94,25 +94,34 @@ else
 fi
 
 if [ "$NEED_OFFICIAL_UPDATE" = true ]; then
-    log "[*] 开始下载最新官方服 APK (支持断点续传)..."
-    curl -L -C - --retry 3 --retry-delay 3 "$FINAL_URL" -o "$APK_PATH"
+    APK_PATH="$BASE_DIR/$APK_NAME"
+    log "[*] 开始下载最新官方服 APK (优先 aria2c 16线程并发加速，失败自动降级 curl)..."
+    if command -v aria2c >/dev/null 2>&1; then
+        aria2c -x 16 -s 16 -k 1M -c --dir="$(dirname "$APK_PATH")" -o "$(basename "$APK_PATH")" "$FINAL_URL" || \
+        curl -L -C - --retry 3 --retry-delay 3 "$FINAL_URL" -o "$APK_PATH"
+    else
+        curl -L -C - --retry 3 --retry-delay 3 "$FINAL_URL" -o "$APK_PATH"
+    fi
     log "[+] 下载完成: $(ls -lh "$APK_PATH" | awk '{print $5}')"
 
     log "[*] 执行无损覆盖安装 (保留玩家所有配置与登录缓存)..."
     "$ADB" -s "$DEVICE" install -r -d "$APK_PATH"
     log "[✔] 官方服覆盖安装成功！"
+    # 清理历史旧包节约磁盘
+    find "$BASE_DIR" -maxdepth 1 -name "arknights-hg-*.apk" ! -name "$(basename "$APK_PATH")" -delete 2>/dev/null || true
+    rm -f "$BASE_DIR/arknights.apk" 2>/dev/null || true
 
     # 发送更新通报
     python3 -c "
-import sys, json, pathlib
+import sys
 sys.path.insert(0, '$BIN_DIR')
-import notifier
+import notifier, json, pathlib
 p = pathlib.Path('$BASE_DIR/config/accounts.json')
 if p.exists():
     with open(p, 'r') as f: data = json.load(f)
     acc = next((a for a in data.get('accounts', []) if a.get('platform') == 'Official'), None)
     if acc:
-        notifier.dispatch_account_notify(acc, '【明日方舟大版本更新】官方服已自动升级', '### 官方服大版本更新完成\n- **版本升级**: $CURRENT_VER -> $CDN_FORMATTED_VER\n- **安装方式**: 无损覆盖安装 (已保留登录凭据)\n- **状态**: 模拟器已安全归位待命', event_type='on_daily_summary')
+        notifier.dispatch_account_notify(acc, '【明日方舟大版本更新】官方服已自动升级', '### 明日方舟官方服大版本更新完成\n- **版本升级**: $CURRENT_VER -> $CDN_FORMATTED_VER\n- **安装方式**: 无损覆盖安装 (已保留登录凭据)\n- **状态**: 模拟器已安全归位待命', event_type='on_daily_summary')
 " 2>/dev/null || true
 fi
 

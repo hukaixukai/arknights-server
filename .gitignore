@@ -20,6 +20,16 @@ config/accounts.json
 config/users.json
 config/system_settings.json
 config/run_config.json
+config/secrets.json
+
+# Private / personal artifacts (never commit)
+bin/adb
+bin/*.bak
+bin/*.bak_*
+bin/*.bak.*
+*.bak
+*.bak_*
+*.bak.*
 
 # Game packages & runtime data
 *.apk

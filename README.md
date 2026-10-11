@@ -245,6 +245,7 @@ cd arknights-server
 cp config/accounts.example.json config/accounts.json
 cp config/system_settings.example.json config/system_settings.json
 cp config/users.example.json config/users.json
+cp config/secrets.example.json config/secrets.json
 ```
 
 然后按注释填写 `config/*.json`。管理员的密码哈希可以这样生成：
@@ -255,7 +256,9 @@ python3 -c "import hashlib; print(hashlib.sha256('你的密码'.encode()).hexdig
 
 把输出填进 `users.json` 的 `password_hash`。`accounts.example.json` 里的 `infrast.plan_file` 指向 `config/default_plan.example.json`，这是一份三班次示例排班表，可直接改名使用或替换成自己导出的排班文件。
 
-> 注意：`config/` 下的真实配置文件（`accounts.json`、`users.json` 等）已在 `.gitignore` 中排除，不会被提交。`users.example.json` 里预置了一个随机生成的管理员密码，请按上面的命令换成自己的。
+`config/secrets.json` 用于集中存放全局敏感项（如 WxPusher 应用 Token、通知里「打开控制台」按钮指向的地址），避免密钥硬编码进源码。也可以改用同名大写环境变量覆盖（`WXPUSHER_APP_TOKEN`、`CONSOLE_URL`），环境变量优先级更高。
+
+> 注意：`config/` 下的真实配置文件（`accounts.json`、`users.json`、`secrets.json` 等）已在 `.gitignore` 中排除，不会被提交。`users.example.json` 里预置了一个随机生成的管理员密码，请按上面的命令换成自己的。
 
 ### 3. 启动服务
 

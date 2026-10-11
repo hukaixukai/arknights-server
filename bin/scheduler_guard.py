@@ -113,94 +113,105 @@ def mask_account_str(acc_str: str) -> str:
     return "****"
 
 def get_account_effective_times(acc):
-    inf = acc.get("infrast", {})
-    mode = inf.get("mode", "custom_plan")
-    if mode in ("daily_once", "auto_rotation"):
-        single_time = inf.get("daily_single_time", "16:00")
-        return [single_time]
+    """
+    获取指定账号当前实际生效的定时执行时间点列表 (HH:MM 格式)
+    【核心唯一事实来源】：优先从 SQLite 数据库的 maa_timers 表读取启用的班次；
+    兜底回退至 account.schedules 或默认三班倒 (10:00, 16:00, 22:00)
+    """
+    acc_id = acc.get("id") if isinstance(acc, dict) else str(acc)
+    if not acc_id:
+        return ["10:00", "16:00", "22:00"]
 
-    plan_file = inf.get("plan_file", "default_plan.json")
-    if not plan_file.endswith(".json"):
-        plan_file += ".json"
-    
-    owner = acc.get("owner_username", DEFAULT_ADMIN_USER)
-    # 严格在所有者专属隔离目录查找，绝不向他人私有目录借读
-    p_path = INFRAST_DIR / owner / plan_file
-    if not p_path.exists():
-        p_path = INFRAST_DIR / plan_file
+    try:
+        t_rec = db.get_maa_timers(acc_id)
+        if t_rec and isinstance(t_rec.get("timers"), dict):
+            t_list = t_rec["timers"].get("List", [])
+            active_times = []
+            for item in t_list:
+                if item.get("IsEnabled"):
+                    h = int(item.get("Hour", 0))
+                    m = int(item.get("Minute", 0))
+                    active_times.append(f"{h:02d}:{m:02d}")
+            if active_times:
+                return sorted(active_times, key=lambda x: parse_time_to_minutes(x))
+    except Exception as e:
+        print(f"[!] 读取账号 [{acc_id}] maa_timers 异常: {e}")
 
-    if p_path.exists():
-        try:
-            with open(p_path, "r", encoding="utf-8") as f:
-                p_data = json.load(f)
-            times = []
-            for plan in p_data.get("plans", []):
-                periods = plan.get("period", [])
-                if periods and len(periods[0]) > 0:
-                    times.append(periods[0][0])
-            if times:
-                return times
-        except Exception:
-            pass
+    # 兜底：兼容旧 schedules 字段
+    if isinstance(acc, dict) and acc.get("schedules"):
+        return acc.get("schedules")
+    return ["10:00", "16:00", "22:00"]
 
-    return acc.get("schedules", ["16:00"])
+def get_account_window_minutes(acc_id: str) -> int:
+    """获取指定账号的独占时段分钟数 (默认 40 分钟)"""
+    try:
+        t_rec = db.get_maa_timers(acc_id)
+        if t_rec:
+            return int(t_rec.get("window_minutes") or 40)
+    except Exception:
+        pass
+    return 40
 
 def get_all_occupied_slots(exclude_acc_id=None):
+    """
+    获取全服所有账号已占用的独占时段列表
+    【标准】：完全基于 maa_timers 表，独占窗口统一为 40 分钟，跨午夜离散分钟无缝衔接
+    """
     accs = db.list_accounts()
     slots = []
     for acc in accs:
         if not acc.get("enabled", True):
             continue
-        if exclude_acc_id and acc.get("id") == exclude_acc_id:
+        acc_id = acc.get("id")
+        if exclude_acc_id and acc_id == exclude_acc_id:
             continue
+        
         times = get_account_effective_times(acc)
-        mode = acc.get("infrast", {}).get("mode", "custom_plan")
-        mode_label = "一天一登" if mode in ("daily_once", "auto_rotation") else "排班表"
+        win_min = get_account_window_minutes(acc_id)
         for t in times:
             m = parse_time_to_minutes(t)
-            end_m = (m + 59) % 1440
+            end_m = (m + win_min) % 1440
             slots.append({
                 "time": t,
                 "start_minutes": m,
                 "end_minutes": end_m,
+                "window_minutes": win_min,
                 "range_str": f"{t} ~ {minutes_to_time_str(end_m)}",
-                "account_id": acc.get("id"),
+                "account_id": acc_id,
                 "account_name": acc.get("name", "未命名账号"),
                 "owner_username": acc.get("owner_username", "system"),
-                "mode": mode,
-                "mode_label": mode_label
+                "mode": "maa_timers",
+                "mode_label": f"MAA定时 ({win_min}分)"
             })
     return sorted(slots, key=lambda x: x["start_minutes"])
 
 def check_schedule_conflicts(target_acc_id, proposed_times):
-    occupied = get_all_occupied_slots(exclude_acc_id=target_acc_id)
-    
-    # 1. 检查自身提交的时间点之间是否冲突 (间隔 < 60 分钟)
-    prop_minutes = []
-    for t in proposed_times:
-        m = parse_time_to_minutes(t)
-        for pm in prop_minutes:
-            dist = time_distance_minutes(m, pm)
-            if dist < 60:
-                return False, f"排班内部冲突：设置的时间点 [{t}] 与 [{minutes_to_time_str(pm)}] 间隔仅 {dist} 分钟（不足 60 分钟），任务之间必须间隔至少 60 分钟！", occupied
-        prop_minutes.append(m)
-
-    # 2. 检查与其他账号的预约时段是否冲突
-    for t in proposed_times:
-        m = parse_time_to_minutes(t)
-        for occ in occupied:
-            dist = time_distance_minutes(m, occ["start_minutes"])
-            if dist < 60:
-                acc_name = occ["account_name"]
-                occ_range = occ["range_str"]
-                msg = (
-                    f"⚠️ 时段冲突：您设置的时间 [{t}] 与账号 [{acc_name}] 的独占时段 [{occ_range}] 间隔仅 {dist} 分钟！\n"
-                    f"单模拟器规则：账号登录后 59 分钟内不可再次登录，两次执行之间至少保留 60 分钟安全间隔。\n"
-                    f"请调整时间以避开该时段。"
-                )
-                return False, msg, occupied
-
-    return True, "", occupied
+    """
+    校验时间点是否冲突，无缝桥接至 maa_config_adapter 40 分钟环形独占引擎
+    """
+    try:
+        import maa_config_adapter
+        mock_timers = {
+            "List": []
+        }
+        for idx, t in enumerate(proposed_times):
+            parts = t.strip().split(":")
+            mock_timers["List"].append({
+                "Id": idx,
+                "IsEnabled": True,
+                "Hour": int(parts[0]),
+                "Minute": int(parts[1])
+            })
+        all_existing = db.list_all_maa_timers()
+        acc_names = {a["id"]: a["name"] for a in db.list_accounts()}
+        is_valid, err_msg = maa_config_adapter.check_timers_conflict(
+            target_acc_id, mock_timers, all_existing, window_minutes=40, acc_names_map=acc_names
+        )
+        occupied = get_all_occupied_slots(exclude_acc_id=target_acc_id)
+        return is_valid, err_msg or "", occupied
+    except Exception as e:
+        occupied = get_all_occupied_slots(exclude_acc_id=target_acc_id)
+        return True, "", occupied
 
 def get_users_overview():
     users_data = db.list_users()
@@ -218,26 +229,27 @@ def get_users_overview():
         u_accs = [a for a in accs_data if a.get("owner_username") == uname]
         acc_list = []
         for a in u_accs:
+            acc_id = a.get("id")
             times = get_account_effective_times(a)
+            win_min = get_account_window_minutes(acc_id)
             slots = []
             for t in times:
                 m = parse_time_to_minutes(t)
-                slots.append(f"{t} ~ {minutes_to_time_str((m + 59) % 1440)}")
+                slots.append(f"{t} ~ {minutes_to_time_str((m + win_min) % 1440)}")
             
             raw_acc_name = a.get("account_name", "")
-            raw_pwd = a.get("game_password", "")
+            t_rec = db.get_maa_timers(acc_id) or {}
             acc_list.append({
-                "id": a.get("id"),
+                "id": acc_id,
                 "name": a.get("name", "未命名账号"),
                 "account_name_masked": mask_account_str(raw_acc_name),
                 "account_name_raw": raw_acc_name,
-                "has_password": bool(raw_pwd),
                 "enabled": a.get("enabled", True),
-                "infrast_mode": a.get("infrast", {}).get("mode", "custom_plan"),
-                "plan_file": a.get("infrast", {}).get("plan_file", ""),
-                "daily_single_time": a.get("infrast", {}).get("daily_single_time", "16:00"),
+                "window_minutes": win_min,
                 "occupied_times": times,
-                "occupied_slots": slots
+                "occupied_slots": slots,
+                "timers_list": (t_rec.get("timers") or {}).get("List", []),
+                "timers_count": len(times)
             })
 
         result["users"].append({
@@ -278,7 +290,10 @@ def sync_all_system_crontabs():
     try:
         is_paused = (db.get_system_setting("cron_paused") == "true")
         prefix = "# PAUSED: " if is_paused else ""
-        cur_cron = subprocess.check_output(["crontab", "-l"], text=True)
+        try:
+            cur_cron = subprocess.check_output(["crontab", "-l"], text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            cur_cron = ""
         preserved = [l for l in cur_cron.splitlines() if "ark_service_ctl.sh" not in l and "明日方舟" not in l]
         new_lines = preserved[:]
         new_lines.append("\n# 明日方舟多账号自动化自主调度流水线 (自适应全天时段与指定账号)")

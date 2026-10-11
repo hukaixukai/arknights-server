@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-通知中心: 支持 WxPusher 与 SMTP 邮箱，每个账号独立配置
+明日方舟自动化通知中心: 支持 WxPusher 与 SMTP 邮箱授权码，每个账号独立配置
 """
 
 import os
@@ -16,10 +16,28 @@ from email.mime.multipart import MIMEMultipart
 from email.header import Header
 
 BASE_DIR = pathlib.Path(os.getenv("ARK_BASE_DIR", str(pathlib.Path(__file__).resolve().parent.parent)))
-# 默认 WxPusher App Token，可在账号配置中覆盖
-DEFAULT_WXPUSHER_APP_TOKEN = os.getenv("WXPUSHER_APP_TOKEN", "")
-# 控制台地址前缀，用于通知里附带的跳转链接
-CONSOLE_URL = os.getenv("CONSOLE_URL", "")
+# 本机私有配置（已被 .gitignore 排除，不入库），用于集中存放 WxPusher Token / 控制台地址等敏感项
+SECRETS_FILE = BASE_DIR / "config" / "secrets.json"
+
+def _load_secret(key, default=""):
+    """读取私密配置：环境变量优先，其次 config/secrets.json，最后回退 default，避免密钥硬编码入库。"""
+    val = (os.getenv(key.upper()) or "").strip()
+    if val:
+        return val
+    try:
+        if SECRETS_FILE.exists():
+            with open(SECRETS_FILE, "r", encoding="utf-8") as f:
+                val = (json.load(f).get(key) or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return default
+
+# 默认 WxPusher App Token：账号级配置可覆盖；全局缺省值请写入 config/secrets.json 或环境变量 WXPUSHER_APP_TOKEN
+DEFAULT_WXPUSHER_APP_TOKEN = _load_secret("wxpusher_app_token", "")
+# 通知里「打开控制台」按钮指向的地址：环境变量 CONSOLE_URL > config/secrets.json > 空
+CONSOLE_URL = _load_secret("console_url", "")
 
 def send_wxpusher(content, summary="明日方舟托管通知", uids=None, topic_ids=None, app_token=None, url=None):
     """通过 WxPusher API 发送通知，自适应支持 SPT_ 极简推送与 AT_ 完整推送"""
@@ -28,7 +46,7 @@ def send_wxpusher(content, summary="明日方舟托管通知", uids=None, topic_
         if not token:
             token = DEFAULT_WXPUSHER_APP_TOKEN
         if not token:
-            return False, "未配置 WxPusher Token"
+            return False, "未配置 WxPusher Token（请在账号通知配置中填写，或设置 config/secrets.json / 环境变量 WXPUSHER_APP_TOKEN）"
 
         # 1. 如果是 SPT_ (Simple Push Token)，直接走简易推送通道
         if token.startswith("SPT_"):
@@ -36,8 +54,9 @@ def send_wxpusher(content, summary="明日方舟托管通知", uids=None, topic_
                 "title": summary[:50],
                 "content": content,
             }
-            if url:
-                query["url"] = url
+            link = url or CONSOLE_URL
+            if link:
+                query["url"] = link
             spt_url = f"https://wxpusher.zjiecode.com/api/send/message/spt/{token}?{urllib.parse.urlencode(query)}"
             req = urllib.request.Request(spt_url)
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -128,7 +147,7 @@ def dispatch_account_notify(account_data, subject, markdown_content, html_conten
             uids=uids,
             topic_ids=topics,
             app_token=token,
-            url=CONSOLE_URL or None
+            url=CONSOLE_URL
         )
         results["wxpusher"] = {"success": ok, "msg": msg}
 
@@ -167,7 +186,7 @@ if __name__ == "__main__":
     # 命令行测试模式: python3 notifier.py test <account_id>
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         acc_id = sys.argv[2] if len(sys.argv) > 2 else ""
-        acc_file = BASE_DIR / "config" / "accounts.json"
+        acc_file = pathlib.Path(os.getenv("ARK_BASE_DIR", str(pathlib.Path(__file__).resolve().parent.parent))) / "config" / "accounts.json"
         if acc_file.exists():
             with open(acc_file, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -176,7 +195,7 @@ if __name__ == "__main__":
                 res = dispatch_account_notify(
                     acc,
                     subject="明日方舟测试通知",
-                    markdown_content="### 通信测试\n这是一条测试消息，验证 WxPusher 与邮箱配置是否正常连通！\n- 时间: 刚刚\n- 状态: 正常",
+                    markdown_content="### 明日方舟通信测试\n这是一条测试消息，验证 WxPusher 与 邮箱授权码 配置是否正常连通！\n- 时间: 刚刚\n- 状态: 正常",
                     event_type=None
                 )
                 print(json.dumps(res, ensure_ascii=False, indent=2))
