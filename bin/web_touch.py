@@ -5365,9 +5365,6 @@ APP_PAGE = """<!DOCTYPE html>
                         <span class="slot-pill" style="font-size:11px;font-weight:bold;">${timeStr} ~ ${endStr} (${windowMinutes}分独占)</span>
                     </div>
                     <div style="display:flex;align-items:center;gap:6px;">
-                        <select style="font-size:11px;padding:2px 6px;margin-bottom:0;" onchange="updateMaaTimerField(${idx}, 'Config', this.value)">
-                            <option value="Default" ${t.Config === 'Default' ? 'selected' : ''}>Default 配置</option>
-                        </select>
                         <button type="button" class="btn-action" style="color:var(--claude-danger);padding:2px 8px;font-size:12px;" onclick="deleteMaaTimerRow(${idx})" title="删除此班次">🗑️</button>
                     </div>
                 </div>`;
@@ -5785,17 +5782,24 @@ APP_PAGE = """<!DOCTYPE html>
 # ==================== 30FPS H.264 硬件直通流媒体服务 ====================
 # ==================== 30FPS H.264 硬件直通流媒体服务 (极速直传) ====================
 class H264StreamServer:
+    PRIVACY_TTL = 0.5  # 隐私/托管状态缓存有效期(秒)，避免每帧扫 /proc、每帧开 DB
+
     def __init__(self):
         self.clients = {}  # sock -> (username, role)
         self.lock = threading.Lock()
         self.proc = None
         self.running = False
+        self._stop_evt = threading.Event()   # 停播信号(可中断 wait)，杜绝并发 worker
+        self._worker_alive = False           # 是否已有存活采集线程(仅在 self.lock 下读写)
+        self._privacy_lock = threading.Lock()
+        self._privacy_cache = None           # (ts, running_owner, active_owner)
         self.cached_sps = None
         self.cached_pps = None
         self.cached_idr = None
         self.thread = None
 
     def add_client(self, sock, username="admin", role="admin"):
+        start_worker = False
         with self.lock:
             self.clients[sock] = (username, role)
             if self.cached_sps and self.cached_pps and self.cached_idr:
@@ -5805,22 +5809,90 @@ class H264StreamServer:
                     self._send_frame(sock, self.cached_idr)
                 except Exception:
                     pass
-            if not self.running:
+            # 仅当当前「没有存活采集线程」时才启动新线程。
+            # 早期版本用 self.running 判定，而 worker 在 time.sleep(0.5) 期间 running
+            # 可能已被 remove_client 置 False，客户端重连会再起一个线程，导致
+            # 两个 screenrecord 并发抢同一个软件编码器 —— 帧率瞬间跌到 ~1fps。
+            if not self._worker_alive:
+                self._worker_alive = True
                 self.running = True
-                self.thread = threading.Thread(target=self._worker, daemon=True)
-                self.thread.start()
+                self._stop_evt.clear()
+                start_worker = True
+        if start_worker:
+            self.thread = threading.Thread(target=self._worker, daemon=True)
+            self.thread.start()
 
     def remove_client(self, sock):
+        proc = None
         with self.lock:
             self.clients.pop(sock, None)
             if not self.clients:
                 self.running = False
-                if self.proc:
+                self._stop_evt.set()
+                proc = self.proc
+                self.proc = None
+        if proc:
+            self._terminate_proc(proc)
+
+    def _terminate_proc(self, proc):
+        """结束本地 adb 进程及其整个进程组，避免 adb shell 残留。"""
+        if not proc:
+            return
+        try:
+            if proc.poll() is not None:
+                return
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
                     try:
-                        self.proc.terminate()
+                        proc.kill()
                     except Exception:
                         pass
-                    self.proc = None
+        except Exception:
+            pass
+
+    def _kill_remote_screenrecord(self):
+        """兜底清理设备侧残留的 screenrecord。
+        proc.terminate() 只杀本地 adb，设备侧 screenrecord 未必随之退出；残留会话会
+        持续占用(软件)编码器，与新会话互相拖慢。"""
+        try:
+            subprocess.run([ADB, "-s", DEVICE, "shell", "pkill", "-l", "SIGINT", "screenrecord"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+
+    def _get_privacy_snapshot(self):
+        """带 TTL 的托管/隐私状态快照 (running_owner, active_owner)。
+        每帧都扫 /proc (is_task_running) + 开 3 个 sqlite 连接会吃掉大量 CPU，
+        直接把软编码器的算力挤掉；这里按 PRIVACY_TTL 缓存。"""
+        now = time.time()
+        with self._privacy_lock:
+            c = self._privacy_cache
+            if c and now - c[0] < self.PRIVACY_TTL:
+                return c[1], c[2]
+        running_info = get_running_task_info()
+        running_owner = running_info.get("owner_username") if running_info else None
+        active_owner = None
+        if not running_info:
+            try:
+                acc = db.get_account(db.get_active_account_id())
+                if acc:
+                    active_owner = acc.get("owner_username")
+            except Exception:
+                pass
+        with self._privacy_lock:
+            self._privacy_cache = (now, running_owner, active_owner)
+        return running_owner, active_owner
 
     def _send_frame(self, sock, data):
         length = len(data)
@@ -5835,26 +5907,18 @@ class H264StreamServer:
 
     def _broadcast(self, data):
         dead = []
-        running_info = get_running_task_info()
-        active_acc_owner = None
-        if not running_info:
-            try:
-                acc = db.get_account(db.get_active_account_id())
-                if acc:
-                    active_acc_owner = acc.get("owner_username")
-            except Exception:
-                pass
+        running_owner, active_owner = self._get_privacy_snapshot()
 
         with self.lock:
             for s, (uname, role) in list(self.clients.items()):
                 can_see = False
                 if role == "admin":
                     can_see = True
-                elif running_info:
-                    if running_info.get("owner_username") == uname:
+                elif running_owner is not None:
+                    if running_owner == uname:
                         can_see = True
                 else:
-                    if active_acc_owner == uname:
+                    if active_owner == uname:
                         can_see = True
 
                 if not can_see:
@@ -5869,84 +5933,106 @@ class H264StreamServer:
 
     def _worker(self):
         print("[H264Stream] 启动 1280x720@30fps 硬件直通流媒体采集...", flush=True)
-        while self.running:
-            with self.lock:
-                if not self.clients:
-                    break
-            if not is_emulator_alive():
-                time.sleep(1)
-                continue
-            cmd = [ADB, "-s", DEVICE, "shell", "screenrecord", "--output-format=h264", "--size", "1280x720", "--bit-rate", "4000000", "--time-limit", "180", "-"]
-            proc = None
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while self.running:
                 with self.lock:
-                    self.proc = proc
-                buf = bytearray()
-                while self.running and proc.poll() is None:
-                    with self.lock:
-                        if not self.clients:
-                            break
-                    if not proc.stdout:
+                    if not self.clients:
                         break
-                    r, _, _ = select.select([proc.stdout], [], [], 0.04)
-                    if r:
-                        chunk = os.read(proc.stdout.fileno(), 16384)
-                        if not chunk: break
-                        buf.extend(chunk)
+                if not is_emulator_alive():
+                    if self._stop_evt.wait(1):
+                        break
+                    continue
+                # 启动前清掉设备侧可能残留的 screenrecord，避免多个软编会话并发
+                self._kill_remote_screenrecord()
+                # --time-limit 上限为 180s（Android 硬性限制，超出会直接报错不产出任何数据），
+                # 到期由外层 while 循环自动重启，间隔约 0.5s。
+                cmd = [ADB, "-s", DEVICE, "shell", "screenrecord", "--output-format=h264", "--size", "1280x720", "--bit-rate", "4000000", "--time-limit", "180", "-"]
+                proc = None
+                try:
+                    # start_new_session：让 adb 及其 shell 子进程独立成组，便于整组回收
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                            start_new_session=True)
+                    with self.lock:
+                        self.proc = proc
+                    buf = bytearray()
+                    while self.running and proc.poll() is None:
+                        with self.lock:
+                            if not self.clients:
+                                break
+                        if not proc.stdout:
+                            break
+                        r, _, _ = select.select([proc.stdout], [], [], 0.04)
+                        if r:
+                            chunk = os.read(proc.stdout.fileno(), 16384)
+                            if not chunk: break
+                            buf.extend(chunk)
 
-                    i = 0
-                    n = len(buf)
-                    starts = []
-                    while i < n - 3:
-                        if buf[i:i+3] == b"\x00\x00\x01":
-                            starts.append((i, 3))
-                            i += 3
-                        elif i < n - 4 and buf[i:i+4] == b"\x00\x00\x00\x01":
-                            starts.append((i, 4))
-                            i += 4
-                        else:
-                            i += 1
+                        # 用 C 层 find 定位起始码，替代逐字节 Python 切片比较
+                        # (大 I 帧可达数十 KB，逐字节扫描会吃掉大量 CPU，挤占软编码器)
+                        starts = []
+                        j = 0
+                        while True:
+                            j = buf.find(b"\x00\x00\x01", j)
+                            if j < 0:
+                                break
+                            if j > 0 and buf[j-1] == 0:
+                                starts.append((j - 1, 4))
+                            else:
+                                starts.append((j, 3))
+                            j += 3
 
-                    nalus = []
-                    if len(starts) > 1:
-                        for idx in range(len(starts) - 1):
-                            p1, _ = starts[idx]
-                            p2, _ = starts[idx+1]
-                            nalus.append(bytes(buf[p1:p2]))
-                        last_p, _ = starts[-1]
-                        buf = buf[last_p:]
-                    elif not r and buf and starts:
-                        nalus.append(bytes(buf))
-                        buf = bytearray()
+                        nalus = []
+                        if len(starts) > 1:
+                            for idx in range(len(starts) - 1):
+                                p1, _ = starts[idx]
+                                p2, _ = starts[idx+1]
+                                nalus.append(bytes(buf[p1:p2]))
+                            last_p, _ = starts[-1]
+                            buf = buf[last_p:]
+                        elif not r and buf and starts:
+                            nalus.append(bytes(buf))
+                            buf = bytearray()
 
-                    for nalu in nalus:
-                        slen = 4 if nalu.startswith(b"\x00\x00\x00\x01") else 3
-                        ntype = nalu[slen] & 0x1f
-                        if ntype == 7:
-                            self.cached_sps = nalu
-                        elif ntype == 8:
-                            self.cached_pps = nalu
-                        elif ntype == 5:
-                            self.cached_idr = nalu
-                        self._broadcast(nalu)
-            except Exception as e:
-                print(f"[H264Stream] 异常: {e}", flush=True)
-            finally:
-                if proc:
-                    try:
-                        proc.terminate()
-                        proc.wait(timeout=0.5)
-                    except Exception:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                with self.lock:
-                    if self.proc is proc:
-                        self.proc = None
-            time.sleep(0.5)
-        print("[H264Stream] 客户端全部离开，硬件直通流媒体休眠待命 (零算力消耗)。", flush=True)
+                        for nalu in nalus:
+                            slen = 4 if nalu.startswith(b"\x00\x00\x00\x01") else 3
+                            ntype = nalu[slen] & 0x1f
+                            if ntype == 7:
+                                self.cached_sps = nalu
+                            elif ntype == 8:
+                                self.cached_pps = nalu
+                            elif ntype == 5:
+                                self.cached_idr = nalu
+                            self._broadcast(nalu)
+                except Exception as e:
+                    print(f"[H264Stream] 异常: {e}", flush=True)
+                finally:
+                    if proc:
+                        self._terminate_proc(proc)
+                        self._kill_remote_screenrecord()
+                    with self.lock:
+                        if self.proc is proc:
+                            self.proc = None
+                if self._stop_evt.wait(0.5):
+                    break
+        finally:
+            # 线程退出：原子清理存活标记与停播信号；若退出瞬间恰有新客户端连入，
+            # 则原地再拉一个线程，避免出现「有客户端却无采集」的空窗。
+            restart = False
+            with self.lock:
+                self._worker_alive = False
+                self.running = False
+                self.proc = None
+                if self.clients:
+                    self._worker_alive = True
+                    self.running = True
+                    self._stop_evt.clear()
+                    restart = True
+            if restart:
+                self.thread = threading.Thread(target=self._worker, daemon=True)
+                self.thread.start()
+            else:
+                self._stop_evt.clear()
+                print("[H264Stream] 客户端全部离开，硬件直通流媒体休眠待命 (零算力消耗)。", flush=True)
 
 STREAM_SERVER = H264StreamServer()
 
