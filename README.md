@@ -115,8 +115,9 @@
 | `bin/update_maa.sh` | 更新 MAA 特征库与核心库 |
 | `bin/update_arknights.sh` | 更新游戏本体 APK |
 | `bin/ark_service_ctl.sh` | 手动控制模拟器与流水线运行 |
-| `docker-compose.yml` | 定义 ReDroid 安卓容器 |
-| `compose-web.yml` | 定义 Web 控制台容器 |
+| `docker-compose.yml` | 一个编排文件，同时定义无头 Android 容器与管理器容器 |
+| `Dockerfile` | 构建管理器镜像（Arch + python / adb / docker / cron） |
+| `entrypoint.sh` | 管理器容器入口：起 cron、写基底定时任务、拉起 Web 面板 |
 
 ---
 
@@ -238,9 +239,14 @@ sudo mount -t binder binder /dev/binderfs
 
 ### 2. 克隆项目并生成配置
 
+先把项目放到宿主机上一个固定的部署目录，后续会把它挂载进容器：
+
 ```bash
+sudo mkdir -p /srv/docker/containers/arknights
+sudo mkdir -p /srv/docker/volumes/arknights/data
 git clone https://github.com/hukaixukai/arknights-server.git
-cd arknights-server
+sudo cp -r arknights-server/. /srv/docker/containers/arknights/
+cd /srv/docker/containers/arknights
 
 cp config/accounts.example.json config/accounts.json
 cp config/system_settings.example.json config/system_settings.json
@@ -260,38 +266,68 @@ python3 -c "import hashlib; print(hashlib.sha256('你的密码'.encode()).hexdig
 
 > 注意：`config/` 下的真实配置文件（`accounts.json`、`users.json`、`secrets.json` 等）已在 `.gitignore` 中排除，不会被提交。`users.example.json` 里预置了一个随机生成的管理员密码，请按上面的命令换成自己的。
 
-### 3. 启动服务
+### 3. 构建并启动（双容器）
+
+本系统由**两个 Docker 容器**组成，用同一个 `docker-compose.yml` 编排：
+
+| 容器 | 镜像 | 职责 |
+| --- | --- | --- |
+| `redroid_arknights` | `erstt/redroid:11.0.0_ndk_ChromeOS` | 无头 Android 11，跑游戏与 MAA |
+| `ark_web_touch` | `arknights-manager:latest` | Web 控制台 + 调度器 + MAA 执行器（Arch 基础镜像，内置 python / adb / docker / cron） |
+
+管理器镜像是**从仓库里的 `Dockerfile` 本地构建**的，所以要先 build 再 up：
 
 ```bash
-# 安卓无头容器
-docker compose up -d
+# 1) 构建管理器镜像（Arch + python/adb/docker/cron，首次约几分钟）
+docker compose build ark_manager
 
-# Web 控制台
-docker compose -f compose-web.yml up -d
+# 2) 一次性拉起两个容器
+docker compose up -d
 ```
 
 浏览器打开 `http://<小主机IP>:8090` 即可访问。
 
-### 4. 配置定时任务
+**为什么是双容器而不是把安卓塞进同一个容器？** Android 容器需要 `privileged` 与 `binderfs` 设备，必须独立运行；管理器容器则通过挂载 `/var/run/docker.sock` 去控制安卓容器的启停，两者职责清晰、互不污染。管理器采用 `network_mode: host` + `pid: host`，这样它才能在同一网络命名空间里 `adb connect 127.0.0.1:5555`，并用 `pid: host` 精准回收模拟器残留子进程。
 
-系统会根据各账号的排班时间自动写入 crontab，无需手动编辑。账号策略里设定好每天的执行时段即可。
+`docker-compose.yml` 里两个容器用到的关键挂载：
 
-### 5. 配置自动更新（可选，推荐）
+- `/dev/binderfs` → Android 容器的 binder 依赖（见第 1 步）；
+- `/dev/dri/card0`、`/dev/dri/renderD128` → 可选 GPU 直通；
+- `/srv/docker/containers/arknights` → `/app`：管理器容器的代码与配置目录（就是第 2 步那个目录）；
+- `/srv/docker/volumes/arknights/data` → Android 容器的 `/data`，同时挂进管理器容器的 `/app/data`，用于存放账号存档与运行数据；
+- `/var/run/docker.sock` → 让管理器容器能启停安卓容器。
 
-两个脚本可以设成每日定时执行，让 MAA 和游戏本体始终跟上最新版本：
+> ADB 已内置于管理器镜像（`android-tools`），**无需把宿主机的 adb 映射进容器**。若你的设备路径或端口不同，改 `docker-compose.yml` 里的 `ADB_TARGET` 与 `devices` 即可。
 
-```cron
-# 每天凌晨检查并更新 MAA 与游戏本体
-0 3 * * * /path/to/arknights-server/bin/update_maa.sh >> /path/to/arknights-server/maa/update.log 2>&1
-30 3 * * * /path/to/arknights-server/bin/update_arknights.sh >> /path/to/arknights-server/update_apk.log 2>&1
+### 4. 目录结构
+
+```
+/srv/docker/containers/arknights/     # 管理器容器的工作目录（挂载为 /app）
+├── bin/                              # 全部 Python 脚本与 shell 工具
+├── config/                           # 账号、用户、密钥等配置（真实文件不入库）
+│   ├── accounts.json                 #   账号与排班
+│   ├── users.json                    #   登录用户与密码哈希
+│   ├── secrets.json                  #   全局密钥（WxPusher Token 等）
+│   ├── arknights.db                  #   SQLite 运行时数据库（自动生成）
+│   └── default_plan.example.json     #   示例排班表
+├── maa/                              # MAA 核心与特征库（自动下载/更新）
+├── docker-compose.yml
+├── Dockerfile
+└── entrypoint.sh
 ```
 
-也可以手动执行：
+提交到 GitHub 的只有代码、示例配置与编排文件；`config/` 下的真实配置、`maa/` 下的下载产物、`data/` 下的运行数据都被 `.gitignore` 排除。
+
+### 5. 定时任务与自动更新（可选，推荐）
+
+管理器容器启动时（`entrypoint.sh`）会做两件事：写入两条**基底定时任务**（每天 `04:30` 更新 MAA、`04:45` 更新游戏本体），并按各账号的排班时间自动同步业务 crontab。所以**日常无需手动编辑 crontab**，在账号策略里设定好执行时段即可。
+
+基底任务默认已包含自动更新，无需额外配置。如果想改成别的时间，直接编辑 `entrypoint.sh` 里的 `CRON_BASE` 段；也可以进容器手动执行：
 
 ```bash
-./bin/update_maa.sh                # 更新 MAA 特征库与核心库
-./bin/update_arknights.sh          # 检查并更新游戏本体
-./bin/update_arknights.sh --force  # 强制重新下载安装包
+docker exec -it ark_web_touch /app/bin/update_maa.sh                # 更新 MAA 特征库与核心库
+docker exec -it ark_web_touch /app/bin/update_arknights.sh          # 检查并更新游戏本体
+docker exec -it ark_web_touch /app/bin/update_arknights.sh --force  # 强制重新下载安装包
 ```
 
 **更新逻辑说明：**
@@ -315,8 +351,8 @@ docker compose -f compose-web.yml up -d
 浏览器打开 `http://<小主机IP>:8090`，用 `config/users.json` 里设置的管理员账号登录。
 
 **2. 添加账号**
-进入「托管账号管理」，填游戏手机号、密码、账号昵称，选择平台（官服 / B服）。
-首次添加时会自动完成一次登录并把该账号的登录态导出成独立存档，后续不再需要重复输入密码。
+进入「托管账号管理」，点「+ 新增托管账号」，填游戏账号标识（官服填手机号尾号、B服填登录名）与备注名，选择平台（官服 / B服）。
+系统**不保存任何游戏账密**：请在左侧投屏里用触屏手动登录该账号一次；之后切换账号由 MAA 通过触屏点击账号列表完成，不读写任何游戏配置文件。
 
 **3. 准备排班文件**
 去 [明日方舟一图流](https://ark.yituliu.cn/) 用图形化界面点选干员、排好班次，导出 MAA 格式的 `.json`，再从面板上传到「基建排班」。（也可以直接用 `config/default_plan.example.json` 改名。）文件里几个班次，系统就会每天登入几次。
@@ -381,24 +417,33 @@ docker compose -f compose-web.yml up -d
 
 **Q：容器起来了，但 ADB 连不上模拟器（`adb devices` 为空）？**
 
-先确认容器状态和端口：
+先确认容器状态，并在管理器容器内测试连接（adb 内置在管理器镜像里，不必装在宿主机）：
 ```bash
 docker ps | grep redroid
-adb connect 127.0.0.1:5555
-adb devices
+docker exec -it ark_web_touch adb connect 127.0.0.1:5555
+docker exec -it ark_web_touch adb devices
 ```
 常见原因有三个：
 - 内核 `binderfs` 没挂载成功（见[部署步骤](#部署步骤)第 1 步，检查 `ls /dev/binderfs`）；
-- `redroid` 容器启动后需要等待 30-60 秒系统才完成开机，用 `adb shell getprop sys.boot_completed` 确认返回 `1`；
-- 宿主机的 adb 版本过旧，建议 1.0.41 以上。
+- `redroid` 容器启动后需要等待 30-60 秒系统才完成开机，用 `docker exec ark_web_touch adb shell getprop sys.boot_completed` 确认返回 `1`；
+- 管理器容器的 `ADB_TARGET` 环境变量或 `docker-compose.yml` 端口映射与实际不符。
 
-**Q：`docker compose` 报错找不到 `adb` 或权限不足？**
+**Q：`docker compose up` 报错找不到镜像 `arknights-manager:latest`？**
 
-`compose-web.yml` 里把宿主机的 adb 挂载进容器，路径写死为 `/usr/bin/adb`。如果你的 adb 装在别处（比如 `~/.local/bin/adb`），需要同步改两处：`ADB_BIN` 环境变量和 volumes 的映射路径。
+管理器镜像是本地构建的，必须先 build 再 up：
+
+```bash
+docker compose build ark_manager
+docker compose up -d
+```
 
 **Q：需要 GPU 硬件加速吗？没有独显能跑吗？**
 
 不是必需。`docker-compose.yml` 里默认映射了 `/dev/dri/*` 做 GPU 直通，如果你的小主机没有核显或设备路径不同，删掉 `devices` 那两行即可，ReDroid 会退回软件渲染，速度慢一些但能正常跑。
+
+**Q：两个容器分别是什么？为什么不能合并成一个？**
+
+`redroid_arknights` 是无头 Android（需 `privileged` + `binderfs` 设备），`ark_web_touch` 是 Web 管理器（需挂载 `docker.sock` 去启停安卓容器、`pid: host` 去回收残留进程）。两者权限与生命周期不同，分开跑更干净、也便于各自重启。
 
 **Q：为什么任务跑完模拟器就关了？我想一直开着。**
 
