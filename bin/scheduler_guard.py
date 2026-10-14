@@ -263,14 +263,32 @@ def get_users_overview():
 
 def sync_all_system_crontabs():
     accs = db.list_accounts()
-    time_to_acc_map = {}
+    # 时间点 -> 占用该时刻的账号列表（保留全部，便于冲突告警）
+    time_to_entries = {}
     for acc in accs:
         if not acc.get("enabled", True):
             continue
+        acc_id = acc.get("id")
+        acc_name = acc.get("name", "未命名账号")
         times = get_account_effective_times(acc)
         for t in times:
-            # 严格映射时间点到具体的 account_id
-            time_to_acc_map[t] = acc.get("id")
+            time_to_entries.setdefault(t, []).append({
+                "id": acc_id,
+                "name": acc_name,
+                "owner": acc.get("owner_username", "system"),
+            })
+
+    # 冲突检测：同一时刻被多账号同时占用时，打日志告警，并按 account id 升序稳定选一（不再静默覆盖）。
+    time_to_acc_map = {}
+    for t in sorted(time_to_entries.keys(), key=parse_time_to_minutes):
+        entries = time_to_entries[t]
+        if len(entries) > 1:
+            names = ", ".join(f"{e['name']}({e['id']})" for e in entries)
+            chosen_name = sorted(entries, key=lambda e: e["id"])[0]["name"]
+            print(f"[!] 调度冲突：时刻 {t} 被多个账号同时占用 -> {names}；"
+                  f"已保留 [{chosen_name}]，其余账号的该时段将被跳过。请调整各自班次以避免重叠。", flush=True)
+        chosen = sorted(entries, key=lambda e: e["id"])[0]
+        time_to_acc_map[t] = chosen["id"]
 
     sorted_times = sorted(list(time_to_acc_map.keys()), key=lambda x: parse_time_to_minutes(x))
     

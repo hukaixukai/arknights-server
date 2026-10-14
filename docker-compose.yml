@@ -5,13 +5,20 @@ services:
     container_name: redroid_arknights
     privileged: true
     restart: unless-stopped
+    # ── 核心资源上限防护 ──
+    # 限制 CPU 上限：最多允许使用 3 个核心 (300%)，保留另外 5 个物理核心给宿主机
+    cpus: 3.0
+    # 限制内存上限：硬上限 4096MB，软保障 2048MB，杜绝内存耗尽导致宿主机 OOM
+    mem_limit: 4096m
+    mem_reservation: 2048m
+    # ──────────────────────
     ports:
       - "127.0.0.1:5555:5555"
     volumes:
-      - /srv/docker/volumes/arknights/data:/data
+      - /vol1/docker/volumes/arknights/data:/data
       - /dev/binderfs:/dev/binderfs
     devices:
-      - /dev/dri/card0:/dev/dri/card0
+      - /dev/dri/card1:/dev/dri/card0
       - /dev/dri/renderD128:/dev/dri/renderD128
     command:
       - androidboot.redroid_width=1280
@@ -29,6 +36,10 @@ services:
     restart: unless-stopped
     network_mode: host
     pid: host
+    # ── 调度器资源上限防护 ──
+    cpus: 1.5
+    mem_limit: 1536m
+    # ────────────────────────
     working_dir: /app
     entrypoint: ["/app/entrypoint.sh"]
     environment:
@@ -38,5 +49,5 @@ services:
       - ARK_BASE_DIR=/app
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /srv/docker/containers/arknights:/app:rw
-      - /srv/docker/volumes/arknights/data:/app/data:rw
+      - /vol1/docker/containers/arknights:/app:rw
+      - /vol1/docker/volumes/arknights/data:/app/data:rw

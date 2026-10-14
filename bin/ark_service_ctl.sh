@@ -54,6 +54,10 @@ start_emu() {
             # 强制校准时区为北京时间 (redroid 默认 GMT，会导致游戏内时间错位 8 小时)
             "$ADB" -s 127.0.0.1:5555 shell "setprop persist.sys.timezone Asia/Shanghai" >/dev/null 2>&1 || true
             "$ADB" -s 127.0.0.1:5555 shell "setprop ro.boot.timezone Asia/Shanghai" >/dev/null 2>&1 || true
+            # 时钟与核心服务预热防抖 (避免 ARM 转译层在证书与时区未就绪时发生 SIGSEGV 段错误)
+            echo "[+] 正在进行时区与核心服务预热防抖 (等待 5s 确保完全就绪)..."
+            "$ADB" -s 127.0.0.1:5555 shell "date '+%Y-%m-%d %H:%M:%S %Z'" >/dev/null 2>&1 || true
+            sleep 5
             break
         fi
         sleep 2
@@ -76,8 +80,28 @@ restart_emu() {
 }
 
 start_game() {
-    echo "[+] 启动明日方舟客户端..."
-    "$ADB" -s 127.0.0.1:5555 shell am start -n com.hypergryph.arknights/com.u8.sdk.U8UnityContext || true
+    local pkg="com.hypergryph.arknights"
+    echo "[+] 启动明日方舟客户端 ($pkg)..."
+    "$ADB" -s 127.0.0.1:5555 shell am start -n "$pkg/com.u8.sdk.U8UnityContext" || true
+
+    # 启动防抖与闪退自愈检测
+    sleep 3.5
+    local pid=""
+    pid=$("$ADB" -s 127.0.0.1:5555 shell "pidof $pkg" 2>/dev/null | tr -d '\r\n')
+    if [ -z "$pid" ]; then
+        echo "[!] 检测到方舟客户端首启未检测到进程 (可能触发冷启动时区抖动)，正在执行自动自愈重拉..."
+        sleep 2
+        "$ADB" -s 127.0.0.1:5555 shell am start -n "$pkg/com.u8.sdk.U8UnityContext" || true
+        sleep 3
+        pid=$("$ADB" -s 127.0.0.1:5555 shell "pidof $pkg" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$pid" ]; then
+            echo "[✔] 方舟自愈重拉成功 (PID=$pid)，客户端已进入平稳运行状态！"
+        else
+            echo "[!] 二次唤醒仍在异步启动中，交由 MAA 任务链继续识别。"
+        fi
+    else
+        echo "[✔] 方舟客户端启动平稳 (PID=$pid)。"
+    fi
 }
 
 show_status() {
@@ -123,6 +147,8 @@ run_pipeline() {
         echo "[*] 检测到安卓模拟器未运行，正在按需自动拉起..."
         start_emu
         auto_stop=true
+        # 冷启动时由托管系统提前拉起方舟并执行自愈检测，让 MAA 介入时处于完全就绪状态
+        start_game
     fi
 
     echo "[*] 启动 MAA 任务: $task_type $arg2 $arg3"

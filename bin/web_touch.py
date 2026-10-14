@@ -4033,7 +4033,7 @@ APP_PAGE = """<!DOCTYPE html>
                 platform: platform || "Official",
                 enabled: true,
                 owner_username: (typeof CURRENT_USER !== 'undefined' && CURRENT_USER.username) ? CURRENT_USER.username : 'admin',
-                schedules: ['10:00', '16:00', '22:00'],
+                schedules: [],
                 infrast: { 
                     mode: "custom_plan", 
                     plan_file: "default_plan.json", 
@@ -4055,14 +4055,14 @@ APP_PAGE = """<!DOCTYPE html>
                 body: JSON.stringify({account: newAcc})
             }).then(r => r.json()).then(res => {
                 if (res.success) {
-                    alert(`新托管账号 ${name} 创建成功！\n请到左侧投屏解锁后，触屏手动登录该账号一次。`);
+                    alert(`新托管账号 ${name} 创建成功！\n请到左侧投屏解锁后，触屏手动登录该账号一次，并在右侧排班时间轴中配置定时挂机时段。`);
                     closeNewAccountModal();
                     loadAccountsData().then(() => {
                         load24HTimeline();
                         if (typeof loadAdminOverview === 'function') loadAdminOverview();
                     });
                 } else {
-                    alert('创建失败: ' + (res.error || ''));
+                    alert('创建失败: ' + (res.message || res.error || '时段冲突或未知错误'));
                 }
             }).catch(e => alert('请求异常: ' + e));
         }
@@ -6636,6 +6636,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for keep in ("schedules", "created_at"):
                     if keep not in updated_acc and keep in old_acc:
                         updated_acc[keep] = old_acc[keep]
+
+                # 【防时段抢占】若本次修改携带班次，先校验是否与其他账号冲突
+                _proposed = updated_acc.get("schedules")
+                if _proposed:
+                    _ok, _err, _ = scheduler_guard.check_schedule_conflicts(acc_id, _proposed)
+                    if not _ok:
+                        self.send_response(409)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "success": False,
+                            "error": "schedule_conflict",
+                            "message": f"时段冲突，无法保存：{_err}"
+                        }, ensure_ascii=False).encode("utf-8"))
+                        return
                 db.save_account(updated_acc)
                 scheduler_guard.sync_all_system_crontabs()
                 self.send_response(200)
@@ -6695,6 +6710,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 acc_id = new_acc.get("id") or ("acc_" + str(int(time.time() * 1000)))
                 new_acc["id"] = acc_id
+
+                # 【防时段抢占】新账号未显式排班时绝不套用默认三班倒，避免静默占用他人时段
+                _proposed = new_acc.get("schedules")
+                if _proposed:
+                    _ok, _err, _ = scheduler_guard.check_schedule_conflicts(acc_id, _proposed)
+                    if not _ok:
+                        # 兼容处理：若为旧前端自动附带的默认三班倒，自动清空排班降级创建，不阻断建号
+                        if sorted(_proposed) == ["10:00", "16:00", "22:00"]:
+                            new_acc["schedules"] = []
+                        else:
+                            self.send_response(409)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                "success": False,
+                                "error": "schedule_conflict",
+                                "message": f"时段冲突，无法添加账号：{_err}"
+                            }, ensure_ascii=False).encode("utf-8"))
+                            return
+                else:
+                    new_acc["schedules"] = []
 
                 db.save_account(new_acc)
                 scheduler_guard.sync_all_system_crontabs()
